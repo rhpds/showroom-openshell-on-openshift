@@ -1,0 +1,121 @@
+= Troubleshooting
+:navtitle: Troubleshooting
+:toc:
+:toc-placement: preamble
+:icons: font
+
+This page is a reference for diagnosing problems across all lab levels.
+Start with the read-only inspection commands to confirm the cause before applying any corrective action.
+Each symptom maps to a specific likely cause so you can avoid broad changes that mask the real problem.
+
+[#controller-discovery]
+== Controller discovery
+
+The Agent Sandbox controller deployment name varies between releases.
+Run this block to discover the correct name before inspecting logs or events.
+
+[source,bash,role="execute"]
+----
+CONTROLLERS="$(kubectl -n agent-sandbox-system get deployment -o name | \
+  grep -E '/.*agent.*sandbox.*controller|/.*sandbox.*controller')"
+test "$(printf '%s\n' "${CONTROLLERS}" | wc -l | tr -d ' ')" = 1
+CONTROLLER="${CONTROLLERS#deployment.apps/}"
+kubectl -n agent-sandbox-system describe deployment "${CONTROLLER}"
+kubectl -n agent-sandbox-system logs deployment/"${CONTROLLER}" --tail=200
+----
+
+If the `test` command fails, more than one matching deployment is present.
+Inspect all matches before proceeding so you know which controller is active.
+
+== Symptom guide
+
+Match observed behavior to a likely cause and a starting diagnostic command.
+Run the safe diagnostic first, confirm the cause matches the evidence, then apply the corrective action.
+
+[cols="1,2,2,2",options="header"]
+|===
+|Symptom |Safe diagnostic |Likely cause |Corrective action
+
+|Agent Sandbox controller does not roll out
+|Run the <<controller-discovery,controller discovery block>> above
+|Image pull failure, scheduling constraint, RBAC gap, or an incompatible duplicate controller already installed
+|Inspect pod events and logs from the discovery block output
+
+|Sandbox pod is rejected by OpenShift
+|`oc -n {openshell_namespace} get events --sort-by=.lastTimestamp`
+|`openshell-sandbox` service account cannot use the required Security Context Constraint
+|Repeat the Level 1 SCC grant procedure
+
+|Gateway reports PKI or JWT signing-key failure
+|`kubectl -n {openshell_namespace} describe statefulset openshell` and `kubectl -n {openshell_namespace} get secret`
+|PKI hook was disabled but the signing Secret is absent
+|Recreate the signing Secret using the Level 1 Ed25519 procedure
+
+|Client cannot reach the gateway
+|`kubectl -n {openshell_namespace} get pod,svc,endpoints` and `kubectl -n {openshell_namespace} logs statefulset/openshell --tail=50`
+|Gateway not ready, wrong namespace or port in the connection string, or a stale port-forward session
+|Correct the service DNS target and restart the port-forward
+
+|CLI or plugin behaves unexpectedly
+|`openshell --version` and `openshell plugin status`
+|Version mismatch between the local CLI and the in-cluster gateway
+|Install the documented CLI version described on the Prerequisites page
+
+|Route returns authentication error
+|`oc -n {openclaw_namespace} get route,svc,endpoints` and review gateway logs
+|Missing bearer token, wrong Route backend target, or device-auth settings blocking access
+|Confirm the Route target points to the correct Service and that a valid token is present
+
+|Control UI reports origin not allowed
+|`openshell config get allowedOrigins`
+|The Route origin is absent from the allowed-origins list, or it has a trailing slash
+|Add the exact HTTPS origin without a trailing slash, reapply the configuration, and restart the gateway pod
+
+|Control UI requests device pairing
+|`kubectl -n {openclaw_namespace} get configmap openclaw-config -o yaml`
+|The device-auth bypass ConfigMap was not applied or was overwritten
+|Reapply the bypass manifest and restart the OpenClaw pod
+
+|Policy fails with `expected struct NetworkBinaryDef`
+|Inspect binary entries in the active policy
+|OpenShell {openshell_version} requires object entries with a `path` field rather than bare strings
+|Update binary entries to use the object form `{ path: /usr/bin/node }` and create a fresh sandbox
+
+|Request denied by policy
+|`openshell policy get --full` and review gateway logs
+|Destination, HTTP method, path pattern, or binary does not match the active policy rules
+|Update the policy to match the intended request, then create a fresh sandbox to pick up the change
+
+|Retry uses old policy or files
+|`kubectl get sandbox -A` — check `creationTimestamp` values
+|Session scope reused a sandbox created before the policy change took effect
+|Use a fresh session key or a new `RUN_ID` to force a new sandbox
+
+|Cleanup leaves resources behind
+|`kubectl get sandbox -A`
+|A resource was omitted from the deletion commands in the level's cleanup section
+|Identify the owning level from the resource labels, then run that level's exact deletion commands
+|===
+
+== Diagnostic bundle
+
+The following commands capture names, status, events, and recent logs without exposing Secret values.
+Run the full bundle before opening a support request or sharing output for review.
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get pod,svc,statefulset,sandbox,pvc -o wide
+kubectl -n {openclaw_namespace} get pod,svc,route,configmap -o wide
+kubectl -n {openshell_namespace} get events --sort-by=.lastTimestamp
+kubectl -n {openclaw_namespace} get events --sort-by=.lastTimestamp
+kubectl -n {openshell_namespace} logs statefulset/openshell --tail=200
+----
+
+WARNING: Before sharing bundle output, redact all bearer tokens, credential references, user prompts, model responses, and private hostnames.
+Review each line before posting to a public channel or support ticket.
+
+== Lima note
+
+Some local Lima-based environments require the gateway bind address to be adjusted from the default loopback.
+That adjustment is specific to the local VM workflow.
+Do not apply Lima bind-address workarounds to an OpenShift Service — it is not needed and will not have the expected effect.

@@ -1,0 +1,258 @@
+= Prerequisites and Environment
+:navtitle: Prerequisites and Environment
+:toc:
+:toc-placement: preamble
+:icons: font
+
+This page covers everything you need to confirm before starting the lab exercises.
+Work through each section in order — by the end you should have a working terminal session, all required CLI tools installed, and a confirmed connection to your OpenShift {ocp_version} cluster.
+
+== Workshop schedule
+
+The full lab runs approximately 2 hours 15 minutes across five levels.
+
+[cols="1,4,1",options="header"]
+|===
+|Level |Topic |Estimated time
+
+|0
+|Overview, architecture, and environment setup
+|15 min
+
+|1
+|OpenShell on OpenShift — Agent Sandbox controller and gateway install
+|35 min
+
+|2
+|OpenClaw integration — deploy the agent application and delegate execution
+|35 min
+
+|3
+|Policy enforcement — filesystem, network, and process controls
+|35 min
+
+|4
+|Policy profiles — compare deny-all, managed, and allowlist postures
+|15 min
+|===
+
+Each level is a complete stopping point. If time runs short, finish Level 2 and treat Levels 3 and 4 as follow-up exercises.
+
+== Technical requirements
+
+=== Cluster access
+
+* Red Hat OpenShift {ocp_version} cluster with *cluster-admin* privileges
+* A local kubeconfig file that targets the cluster, or access via the bastion host provided in your lab environment
+* The cluster runs on `linux/amd64` nodes — the checked-in CLI archive and OpenClaw container image are built for that architecture
+
+=== Required CLI tools
+
+All tools listed below must be available in the terminal you use for lab commands.
+The bastion host in your lab environment has `oc`, `kubectl`, and Helm 3 pre-installed.
+
+[cols="2,3",options="header"]
+|===
+|Tool |Minimum requirement
+
+|`oc`
+|Matches your OpenShift {ocp_version} cluster
+
+|`kubectl`
+|Compatible with your OpenShift {ocp_version} cluster API
+
+|`helm`
+|Helm 3.x (any recent patch release)
+
+|`openshell`
+|Latest release from the official installer (see <<install-cli>>)
+|===
+
+=== LLM API credential
+
+Level 2 and later levels deploy OpenClaw, which calls an LLM API to drive the agent.
+You need a valid OpenAI-compatible API key available in your shell before starting Level 2.
+The key is never stored in the cluster — it is passed as a Kubernetes Secret that you create and own.
+
+== Accessing your lab environment
+
+Your lab environment is pre-provisioned. Use the credentials below to connect.
+
+=== Bastion host
+
+The bastion host is your primary working terminal for all lab commands.
+Open the terminal tab in the Showroom right pane, or SSH directly:
+
+[source,bash,role="execute",subs="attributes"]
+----
+ssh {bastion_ssh_user_name}@{bastion_public_hostname}
+----
+
+When prompted for a password, enter:
+
+[source,text,role="execute",subs="attributes"]
+----
+{bastion_ssh_password}
+----
+
+=== OpenShift console
+
+Your OpenShift web console is available at:
+
+[source,text,subs="attributes"]
+----
+{openshift_console_url}
+----
+
+You can also open it from the *OpenShift Console* tab in the Showroom right pane.
+
+[IMPORTANT]
+====
+All lab commands assume you are logged in to the cluster with cluster-admin privileges.
+Run `oc whoami` to confirm your active identity before starting any level.
+====
+
+[#install-cli]
+== Install the OpenShell CLI
+
+The OpenShell CLI must be installed in the terminal where you run lab commands.
+On your bastion host, run the official installer:
+
+[source,bash,role="execute"]
+----
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+----
+
+Confirm the installation succeeded:
+
+[source,bash,role="execute"]
+----
+openshell --version
+----
+
+Record the reported version — it is your first troubleshooting reference when client and gateway behavior differ.
+
+=== Verify
+
+`openshell --version` prints a version string without errors.
+If the command is not found, the installer did not add it to your `PATH`.
+Re-run the `curl | sh` installer and check the output for the install location.
+
+NOTE: The installer also starts a local OpenShell gateway on `https://127.0.0.1:17670`. This lab does not use that gateway. In Level 1 you port-forward the in-cluster OpenShift gateway to `http://127.0.0.1:8080`, register it separately, and select it before running any lab commands.
+
+== Lab attribute reference
+
+The following Antora attributes are used throughout the lab instructions.
+Default values are pre-set in `content/antora.yml` and are overwritten at deploy time with your actual provisioned values.
+
+[cols="2,2,3",options="header"]
+|===
+|Attribute |Default value |Description
+
+|`{openshell_namespace}`
+|`openshell`
+|Namespace where the OpenShell gateway StatefulSet is deployed
+
+|`{openclaw_namespace}`
+|`openclaw`
+|Namespace where the OpenClaw application is deployed
+
+|`{openshell_version}`
+|`0.0.82`
+|OpenShell Helm chart version used throughout the lab
+
+|`{agent_sandbox_release}`
+|`v0.5.1`
+|Agent Sandbox controller release tag
+
+|`{agent_sandbox_manifest}`
+|GitHub release asset URL
+|Full URL to the Agent Sandbox `manifest.yaml` for the pinned release
+
+|`{openclaw_version}`
+|`2026.6.11`
+|OpenClaw application version
+
+|`{workload_cli_version}`
+|`0.0.80`
+|OpenShell CLI version bundled inside the OpenClaw container
+
+|`{ocp_version}`
+|`4.21`
+|OpenShift version the lab was validated against
+|===
+
+These attributes keep commands reproducible across sessions.
+If you must override a version, export the corresponding shell variable and update the attribute in `antora.yml` before rebuilding the site.
+
+== Security notice
+
+This lab is an experimental proof of concept, not production security guidance.
+Several exercises use the `privileged` SCC for sandbox pods and disable gateway TLS to keep the integration steps repeatable in an evaluation environment.
+
+WARNING: Use only a private, disposable evaluation cluster. Do not expose the OpenShell gateway Service or port-forward to untrusted clients. Do not treat any lab configuration as a production posture.
+
+The supervised agent process still receives OpenShell's process, filesystem, network, and inference controls — but those controls do not compensate for a privileged, plaintext, unauthenticated deployment.
+
+== Verify your environment
+
+Run the following checks from your bastion terminal before proceeding to Level 1.
+All checks must pass before you continue.
+
+=== Cluster login and version
+
+[source,bash,role="execute"]
+----
+oc whoami
+----
+
+[source,bash,role="execute"]
+----
+oc version
+----
+
+[source,bash,role="execute"]
+----
+kubectl config current-context
+----
+
+=== Helm
+
+[source,bash,role="execute"]
+----
+helm version
+----
+
+Expected: a version string beginning with `v3`.
+
+=== Authorization
+
+The following three commands must each print `yes`.
+A `no` response means your account lacks the required privileges to complete the lab.
+
+[source,bash,role="execute"]
+----
+kubectl auth can-i create namespaces
+----
+
+[source,bash,role="execute"]
+----
+kubectl auth can-i create customresourcedefinitions.apiextensions.k8s.io
+----
+
+[source,bash,role="execute"]
+----
+kubectl auth can-i use scc/privileged
+----
+
+If any check prints `no`, contact your lab administrator to confirm that your account has cluster-admin role binding before proceeding.
+
+=== OpenShell CLI
+
+[source,bash,role="execute"]
+----
+openshell --version
+----
+
+You are ready to start Level 1 once all checks above pass.
+Continue to xref:03-module-01-openshell-install.adoc[Level 1: OpenShell on OpenShift].

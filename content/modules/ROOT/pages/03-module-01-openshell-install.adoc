@@ -1,0 +1,389 @@
+= Module 1: OpenShell on OpenShift
+:navtitle: Module 1: OpenShell on OpenShift
+
+The Agent Sandbox controller and OpenShell gateway together form the supervised execution layer that every AI agent in this lab runs inside.
+Before you can deploy OpenClaw or enforce any policy, those two components must be running and connected.
+
+In this module you install both, connect the OpenShell CLI to the live gateway, and create a smoke-test sandbox that proves the full chain works — from a CLI command down to a Kubernetes pod owned by the controller.
+
+Allow about 30 minutes, not counting image pulls.
+
+== Learning Objectives
+
+By the end of this module, you'll be able to:
+
+* Install the Agent Sandbox controller and confirm its CRD is registered in the cluster
+* Prepare a namespace with the Security Context Constraint required for sandbox pods
+* Deploy the OpenShell gateway using Helm and verify the StatefulSet reaches a ready state
+* Connect the `openshell` CLI to the gateway and confirm a live connection
+* Create a supervised sandbox and correlate CLI evidence with Kubernetes resource state
+
+== Background Concepts
+
+The Agent Sandbox controller watches for `Sandbox` custom resources (kind: `sandboxes.agents.x-k8s.io`) and reconciles them into supervised pods.
+Each sandbox pod runs with an injected supervisor sidecar that enforces the policy profile attached to the Sandbox CR.
+
+OpenShell is the Kubernetes-native gateway that exposes the sandbox lifecycle API to CLI clients and upstream orchestrators like OpenClaw.
+It manages sandbox creation, JWT signing for workload identity, and graceful teardown.
+
+The relationship between the components:
+
+....
+openshell CLI
+     │  (HTTP / port-forward)
+     ▼
+OpenShell gateway (StatefulSet: openshell-0)
+     │  (creates Sandbox CRs)
+     ▼
+Agent Sandbox controller (Deployment: agent-sandbox-controller)
+     │  (creates supervised pods)
+     ▼
+Sandbox pod (with supervisor sidecar)
+....
+
+== Exercise 1: Install the Agent Sandbox Controller
+
+The controller ships as a single manifest from the `kubernetes-sigs/agent-sandbox` project.
+One `kubectl apply` registers the CRD and starts the controller pod.
+
+. Confirm the release values the lab has configured:
++
+[source,bash,role="execute",subs="attributes"]
+----
+echo "Agent Sandbox release : {agent_sandbox_release}"
+echo "Manifest URL         : {agent_sandbox_manifest}"
+----
+
+. Apply the manifest:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl apply -f {agent_sandbox_manifest}
+----
++
+Expect output similar to `namespace/agent-sandbox-system created`, `customresourcedefinition.apiextensions.k8s.io/sandboxes.agents.x-k8s.io created`, and several other resource lines.
+
+. Wait for the controller deployment to roll out:
++
+[source,bash,role="execute"]
+----
+kubectl -n agent-sandbox-system rollout status \
+  deployment/agent-sandbox-controller --timeout=180s
+----
+
+. Confirm the controller image tag matches the expected release:
++
+[source,bash,role="execute"]
+----
+kubectl -n agent-sandbox-system get deploy agent-sandbox-controller \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+----
+
+. Verify the Sandbox CRD is registered:
++
+[source,bash,role="execute"]
+----
+kubectl get crd sandboxes.agents.x-k8s.io
+----
+
+WARNING: The {agent_sandbox_release} release advisory warns against upgrading from v0.4.x while active warm-started claims exist. This lab assumes a fresh cluster with no prior Agent Sandbox installation.
+
+=== Verify
+
+Proceed to Exercise 2 when all of the following are true:
+
+* `rollout status` exits with `successfully rolled out`
+* The image output contains `agent-sandbox` and the {agent_sandbox_release} tag
+* `kubectl get crd sandboxes.agents.x-k8s.io` returns a row with a recent `AGE`
+
+== Exercise 2: Prepare the OpenShell Namespace
+
+Sandbox pods need a service account that holds the `privileged` Security Context Constraint.
+You'll create the OpenShell namespace, grant that SCC, and generate the JWT signing secret the gateway uses to sign workload tokens.
+
+WARNING: Granting `privileged` SCC weakens the container boundary. This configuration is intended for private evaluation only and is not appropriate for production workloads.
+
+. Create the namespace (idempotent — safe to run more than once):
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl create namespace {openshell_namespace} \
+  --dry-run=client -o yaml | kubectl apply -f -
+----
+
+. Grant the `privileged` SCC to the `openshell-sandbox` service account:
++
+[source,bash,role="execute",subs="attributes"]
+----
+oc adm policy add-scc-to-user privileged \
+  -z openshell-sandbox -n {openshell_namespace}
+----
+
+. Generate an Ed25519 key pair and store it as the JWT signing secret.
+This block sets shell variables internally, so the namespace is hardcoded to `openshell`:
++
+[source,bash,role="execute"]
+----
+KEY_DIR="$(mktemp -d)"
+openssl genpkey -algorithm Ed25519 -out "${KEY_DIR}/signing.pem"
+openssl pkey -in "${KEY_DIR}/signing.pem" -pubout -out "${KEY_DIR}/public.pem"
+printf 'openshell-0\n' > "${KEY_DIR}/kid"
+kubectl -n openshell create secret generic openshell-jwt-keys \
+  --from-file=signing.pem="${KEY_DIR}/signing.pem" \
+  --from-file=public.pem="${KEY_DIR}/public.pem" \
+  --from-file=kid="${KEY_DIR}/kid" \
+  --dry-run=client -o yaml | kubectl apply -f -
+rm -rf "${KEY_DIR}"
+----
+
+=== Verify
+
+. Confirm the namespace exists:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl get namespace {openshell_namespace}
+----
+
+. Confirm the SCC assignment:
++
+[source,bash,role="execute"]
+----
+oc describe scc privileged | grep openshell
+----
+
+. Confirm the JWT secret was created with all three keys:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} describe secret openshell-jwt-keys
+----
++
+Look for `signing.pem`, `public.pem`, and `kid` listed under `Data`.
+
+== Exercise 3: Install OpenShell
+
+OpenShell ships as an OCI Helm chart.
+You'll create a values file that disables TLS and PKI initialization — appropriate for a private cluster evaluation — then install the chart.
+
+WARNING: The values file sets `server.disableTls: true` and `server.auth.allowUnauthenticatedUsers: true`. The gateway accepts plaintext unauthenticated requests. Do not expose this service beyond a private evaluation cluster.
+
+. Create the Helm values file:
++
+[source,bash,role="execute"]
+----
+cat > /tmp/openshell-values.yaml << 'EOF'
+podSecurityContext:
+  fsGroup: null
+securityContext:
+  runAsUser: null
+pkiInitJob:
+  enabled: false
+server:
+  disableTls: true
+  auth:
+    allowUnauthenticatedUsers: true
+  sandboxImage: quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c
+  sandboxImagePullPolicy: IfNotPresent
+supervisor:
+  sideloadMethod: init-container
+EOF
+----
+
+. Install the chart:
++
+[source,bash,role="execute",subs="attributes"]
+----
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version {openshell_version} \
+  --namespace {openshell_namespace} \
+  --values /tmp/openshell-values.yaml
+----
+
+. Wait for the StatefulSet to roll out (image pulls can take a few minutes):
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} rollout status \
+  statefulset/openshell --timeout=300s
+----
+
+. Confirm the pod is running and ready:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get pods
+----
+
+=== Verify
+
+Proceed when:
+
+* `rollout status` exits cleanly with `partitioned roll out complete` or `roll out complete`
+* A pod named `openshell-0` shows `Running` with `1/1` containers ready
+
+== Exercise 4: Connect the CLI to the Gateway
+
+The `openshell` CLI talks to the gateway over a local port-forward.
+You register the gateway address once; the CLI stores it for all subsequent commands.
+
+. Start the port-forward in the background so the terminal stays available:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} port-forward svc/openshell 8080:8080 &
+----
++
+Press kbd:[Enter] once to get your prompt back after the forwarding message appears.
+When you are finished with this module, run `pkill -f 'port-forward svc/openshell'` to stop it.
+
+. Register the gateway with the CLI:
++
+[source,bash,role="execute"]
+----
+openshell gateway add http://127.0.0.1:8080 --local --name openshift-lab
+----
+
+. Set it as the active gateway:
++
+[source,bash,role="execute"]
+----
+openshell gateway select openshift-lab
+----
+
+. List configured gateways to confirm the selection:
++
+[source,bash,role="execute"]
+----
+openshell gateway list
+----
+
+. Inspect the active gateway details:
++
+[source,bash,role="execute"]
+----
+openshell gateway info
+----
+
+. Check the overall connection status:
++
+[source,bash,role="execute"]
+----
+openshell status
+----
+
+=== Verify
+
+`openshell status` should report a connected gateway pointing to `http://127.0.0.1:8080`.
+`openshell gateway list` should show `openshift-lab` marked as the active entry.
+
+== Exercise 5: Create a Supervised Sandbox
+
+This is the proof point for the module.
+You'll ask OpenShell to create a sandbox, then confirm the Sandbox custom resource exists in Kubernetes and that a pod was created and owned by the Agent Sandbox controller.
+
+. Create the smoke-test sandbox:
++
+[source,bash,role="execute"]
+----
+openshell sandbox create \
+  --name level1-smoke \
+  --cpu 500m \
+  --memory 1Gi \
+  --no-auto-providers \
+  -- bash -lc 'echo supervised-by-openshell'
+----
+
+. List sandboxes from the CLI perspective:
++
+[source,bash,role="execute"]
+----
+openshell sandbox list
+----
+
+. Confirm the Sandbox custom resource exists in Kubernetes:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get sandboxes.agents.x-k8s.io/level1-smoke -o wide
+----
+
+. Check the pod the controller created for this sandbox:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get pods -o wide
+----
+
+. Inspect the pod's `ownerReferences` to confirm the Agent Sandbox controller created it:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get pod \
+  -l agents.x-k8s.io/sandbox-name=level1-smoke \
+  -o yaml | grep -A6 ownerReferences
+----
+
+=== Verify
+
+Level 1 passes when all of the following are true:
+
+* `openshell sandbox list` shows `level1-smoke`
+* `kubectl get sandboxes.agents.x-k8s.io/level1-smoke` returns the resource with a status
+* A pod is running in the `{openshell_namespace}` namespace that corresponds to the sandbox
+* The pod's `ownerReferences` show the Sandbox resource as owner (not a Deployment or ReplicaSet)
+
+== Cleanup
+
+Remove the smoke-test sandbox before moving to Module 2.
+
+. Delete the sandbox through the CLI:
++
+[source,bash,role="execute"]
+----
+openshell sandbox delete level1-smoke
+----
+
+. Confirm both the Sandbox resource and its pod are gone:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get sandboxes,pods
+----
++
+Both should show `No resources found`.
+
+. Stop the port-forward:
++
+[source,bash,role="execute"]
+----
+pkill -f 'port-forward svc/openshell' || true
+----
+
+== Learning Outcomes Checkpoint
+
+Before moving on, make sure you can answer these:
+
+* What does the Agent Sandbox controller do when it sees a new `Sandbox` custom resource?
+* Why does the `openshell-sandbox` service account need the `privileged` SCC in this evaluation setup, and what is the security implication?
+* What are the three files stored in the `openshell-jwt-keys` secret, and what role does each play?
+* How does the `openshell` CLI locate the gateway, and what local mechanism enables that connection?
+* What Kubernetes evidence proves that the sandbox pod is owned by the Agent Sandbox controller rather than created directly?
+
+== Module Summary
+
+You installed and connected all the components that make supervised sandbox execution possible on OpenShift.
+
+What you accomplished:
+
+* Deployed the Agent Sandbox controller from the {agent_sandbox_release} release manifest and confirmed its CRD is registered
+* Created the `{openshell_namespace}` namespace and granted the `privileged` SCC to the `openshell-sandbox` service account
+* Generated an Ed25519 key pair and stored it as the JWT signing secret the gateway uses to sign workload tokens
+* Installed OpenShell version {openshell_version} via Helm and confirmed the StatefulSet reached a ready state
+* Connected the `openshell` CLI to the gateway over a port-forward and validated a live connection
+* Created a `level1-smoke` sandbox and confirmed the full lifecycle with both CLI output and Kubernetes resource inspection
+
+If anything went wrong during this module, see xref:07-troubleshooting.adoc[Troubleshooting].
+
+Continue to Module 2 to deploy OpenClaw as the AI agent that runs inside these supervised sandboxes.

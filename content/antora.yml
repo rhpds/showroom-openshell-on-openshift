@@ -1,6 +1,7 @@
 name: modules
-title: Showroom Collection
+title: "OpenShell and OpenClaw on Red Hat OpenShift"
 version: ~
+start_page: ROOT:index.adoc
 nav:
   - modules/ROOT/nav.adoc
 
@@ -8,7 +9,7 @@ asciidoc:
   attributes:
     experimental: true
     page-pagination: true
-    showroom-collection-version: v1.5.6
+    # Deploy-time values (overwritten by deployer merge)
     guid: abc123
     bastion_public_hostname: bastion.abc123.ocpv00.rhdp.net
     bastion_ssh_user_name: lab-user
@@ -16,3 +17,16 @@ asciidoc:
     ssh_user: lab-user
     openshift_console_url: https://console-openshift-console.apps.cluster-abc123.ocpv00.rhdp.net
     openshift_cluster_ingress_domain: apps.cluster-abc123.ocpv00.rhdp.net
+    lab_name: "OpenShell and OpenClaw on Red Hat OpenShift"
+    openshell_gateway_url: "http://openshell.openshell.svc.cluster.local:8080"
+    # Lab-specific hardcoded values
+    ocp_version: "4.21"
+    openshell_namespace: openshell
+    openclaw_namespace: openclaw
+    openshell_version: "0.0.82"
+    agent_sandbox_release: v0.5.1
+    agent_sandbox_manifest: https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.5.1/manifest.yaml
+    openclaw_version: "2026.6.11"
+    workload_cli_version: "0.0.80"
+    openclaw_image: quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c
+    openshell_plugin_version: "2026.6.11"

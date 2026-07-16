@@ -1,0 +1,658 @@
+= Module 2: OpenClaw Integration
+:navtitle: OpenClaw Integration
+:toc:
+:toc-placement: preamble
+:icons: font
+
+Level 1 left you with a running OpenShell gateway and Agent Sandbox controller.
+This level adds the application layer.
+You deploy OpenClaw, wire it to the gateway through Secret-backed configuration, and run a real agent command that delegates shell execution into a descendant Sandbox pod — then read the result back to prove it happened.
+
+Allow 30 minutes for the exercises, excluding image pull time.
+
+== Learning objectives
+
+By the end of this module you will be able to:
+
+* Deploy the OpenClaw application with the OpenShell sandbox backend configured
+* Manage LLM API and gateway credentials using Kubernetes Secrets
+* Validate OpenShell plugin status and model connectivity from inside the running container
+* Correlate an OpenClaw agent session key with the descendant Agent Sandbox resource in `{openshell_namespace}`
+
+== Background concepts
+
+OpenClaw delegates tool execution rather than running tools itself.
+When the agent decides it needs a shell command, it calls the OpenShell gateway.
+The gateway writes a Sandbox custom resource in the `{openshell_namespace}` namespace.
+The Agent Sandbox controller reconciles that resource into a supervised pod.
+The agent process runs inside that pod, under OpenShell's filesystem, network, and process controls.
+
+**Key concepts:**
+
+* **OpenShell sandbox backend**: The OpenClaw plugin that routes execution requests to the OpenShell gateway instead of running commands locally in the OpenClaw container.
+* **Session scope**: Each agent session maps to exactly one sandbox. The session key becomes part of the Sandbox resource name, so you can trace a session to its pod.
+* **Secret-backed credentials**: The LLM API key and gateway bearer token never appear in the Deployment manifest. They arrive at runtime from Kubernetes Secrets.
+* **Gateway bearer token**: OpenClaw sends this token to authenticate with the OpenShell gateway. You generate it — the gateway accepts whatever value you store in the Secret.
+
+== Exercise 1: Create the Secret contracts
+
+The OpenClaw Deployment mounts two Secrets on startup: one for the LLM API key and one for the gateway bearer token.
+Create the namespace and both Secrets before touching any manifests.
+
+=== Steps
+
+. Create the `{openclaw_namespace}` namespace:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl create namespace {openclaw_namespace}
+----
+
+. Set your API key as a temporary environment variable, create the Secret via stdin, then clear the variable:
++
+[source,bash,role="execute"]
+----
+export OPENAI_API_KEY="<your-openai-api-key>"
+printf '%s' "${OPENAI_API_KEY}" | kubectl -n openclaw \
+  create secret generic my-llm-key \
+  --from-file=api-key=/dev/stdin \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset OPENAI_API_KEY
+----
++
+Replace `<your-openai-api-key>` with your actual key before running.
+The `printf` pattern sends the key directly into the Secret without writing it to a file or shell history.
+`unset` clears it from the environment immediately after.
+
+. Generate a random gateway bearer token and store it in a Secret:
++
+[source,bash,role="execute",subs="attributes"]
+----
+openssl rand -hex 32 | kubectl -n {openclaw_namespace} \
+  create secret generic openclaw-gateway-token \
+  --from-file=token=/dev/stdin \
+  --dry-run=client -o yaml | kubectl apply -f -
+----
++
+The token pipes directly into the Secret — it is never assigned to a shell variable or written to disk.
+You will retrieve it from the Secret in the dashboard access section.
+
+=== Verify
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get secret my-llm-key openclaw-gateway-token
+----
+
+Both Secrets should appear with `TYPE: Opaque` and `DATA: 1`.
+
+== Exercise 2: Deploy OpenClaw
+
+OpenClaw runs from a single Deployment backed by ConfigMaps for its config file and managed security policy.
+You create all files inline and apply them in sequence.
+
+=== Steps
+
+. Create the OpenClaw configuration file:
++
+[source,bash,role="execute"]
+----
+cat > /tmp/openclaw-config.json << 'EOF'
+{
+  "agents": {
+    "defaults": {
+      "model": {"primary": "openai/gpt-4o-mini"},
+      "sandbox": {
+        "mode": "all",
+        "backend": "openshell",
+        "scope": "session",
+        "workspaceAccess": "rw"
+      }
+    }
+  },
+  "gateway": {
+    "controlUi": {
+      "allowedOrigins": ["${OPENCLAW_PUBLIC_URL}"],
+      "dangerouslyDisableDeviceAuth": true
+    }
+  },
+  "models": {
+    "providers": {
+      "openai": {
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "env:OPENAI_API_KEY",
+        "models": [{"id": "gpt-4o-mini", "name": "GPT-4o mini"}]
+      }
+    }
+  },
+  "plugins": {
+    "allow": ["openshell"],
+    "entries": {
+      "openshell": {
+        "enabled": true,
+        "config": {
+          "from": "quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c",
+          "mode": "remote",
+          "gatewayEndpoint": "http://openshell.openshell.svc.cluster.local:8080",
+          "policy": "/opt/openclaw/config/policies/openclaw-managed-policy.yaml",
+          "providers": ["openai"],
+          "timeoutSeconds": 180
+        }
+      }
+    }
+  }
+}
+EOF
+----
++
+WARNING: This config sets `dangerouslyDisableDeviceAuth: true`. Any client holding the gateway bearer token can use the control UI without device pairing. Use this only on a private, disposable evaluation cluster.
++
+The `${OPENCLAW_PUBLIC_URL}` value in `allowedOrigins` is a runtime environment variable resolved by the container — not an Antora attribute. You set it in a later step after the Route is created.
+
+. Create the managed security policy file:
++
+[source,bash,role="execute"]
+----
+cat > /tmp/openclaw-managed-policy.yaml << 'EOF'
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null, /opt/openclaw]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+network_policies:
+  openai_api:
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        access: full
+        enforcement: enforce
+    binaries:
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
+      - { path: "/app/**" }
+  github_api_read_only:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/curl }
+      - { path: /usr/bin/gh }
+      - { path: /usr/local/bin/gh }
+  github_content_reachability:
+    endpoints:
+      - host: github.com
+        port: 443
+      - host: raw.githubusercontent.com
+        port: 443
+      - host: objects.githubusercontent.com
+        port: 443
+      - host: release-assets.githubusercontent.com
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/local/bin/curl }
+      - { path: /usr/bin/git }
+      - { path: /usr/local/bin/git }
+  npm_registry_reachability:
+    endpoints:
+      - host: registry.npmjs.org
+        port: 443
+    binaries:
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/node }
+      - { path: /usr/bin/npm }
+      - { path: /usr/local/bin/npm }
+EOF
+----
+
+. Create ConfigMaps from the config files:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} create configmap openclaw-config \
+  --from-file=config.json=/tmp/openclaw-config.json \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+kubectl -n {openclaw_namespace} create configmap openclaw-policies \
+  --from-file=openclaw-managed-policy.yaml=/tmp/openclaw-managed-policy.yaml \
+  --dry-run=client -o yaml | kubectl apply -f -
+----
+
+. Create the Kubernetes manifest file. This contains the ServiceAccount, Deployment, Service, and Route separated by `---`:
++
+[source,bash,role="execute"]
+----
+cat > /tmp/openclaw-all.yaml << 'EOF'
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openclaw
+  namespace: openclaw
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw
+  namespace: openclaw
+  labels:
+    app.kubernetes.io/name: openclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openclaw
+    spec:
+      serviceAccountName: openclaw
+      automountServiceAccountToken: false
+      initContainers:
+      - name: seed-openclaw
+        image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+        command:
+        - sh
+        - -c
+        - |
+          set -eu
+          CLI_VERSION="0.0.80"
+          INSTALL_DIR="/opt/openclaw/bin"
+          BIN="${INSTALL_DIR}/openshell"
+          echo "==> Downloading OpenShell CLI v${CLI_VERSION}"
+          curl -fsSL \
+            "https://github.com/NVIDIA/OpenShell/releases/download/v${CLI_VERSION}/openshell-linux-amd64" \
+            -o "${BIN}"
+          chmod +x "${BIN}"
+          echo "==> Verifying binary"
+          "${BIN}" --version
+          echo "==> Installing OpenShell plugin"
+          "${BIN}" plugin install openshell \
+            --from "quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c"
+          echo "==> Seed complete"
+        volumeMounts:
+        - name: openclaw-bin
+          mountPath: /opt/openclaw/bin
+      containers:
+      - name: openclaw
+        image: quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c
+        ports:
+        - containerPort: 18789
+          name: http
+        env:
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: my-llm-key
+              key: api-key
+        - name: OPENCLAW_GATEWAY_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: openclaw-gateway-token
+              key: token
+        - name: OPENCLAW_CONFIG_PATH
+          value: /opt/openclaw/config/config.json
+        volumeMounts:
+        - name: openclaw-bin
+          mountPath: /opt/openclaw/bin
+          readOnly: true
+        - name: openclaw-config
+          mountPath: /opt/openclaw/config
+          readOnly: true
+        - name: openclaw-policies
+          mountPath: /opt/openclaw/config/policies
+          readOnly: true
+        resources:
+          requests:
+            cpu: 250m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+      volumes:
+      - name: openclaw-bin
+        emptyDir: {}
+      - name: openclaw-config
+        configMap:
+          name: openclaw-config
+      - name: openclaw-policies
+        configMap:
+          name: openclaw-policies
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openclaw
+  namespace: openclaw
+spec:
+  selector:
+    app.kubernetes.io/name: openclaw
+  ports:
+  - name: http
+    port: 18789
+    targetPort: http
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: openclaw
+  namespace: openclaw
+spec:
+  to:
+    kind: Service
+    name: openclaw
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+EOF
+----
+
+. Apply all manifests:
++
+[source,bash,role="execute"]
+----
+kubectl apply -f /tmp/openclaw-all.yaml
+----
+
+. Set the OpenShell gateway URL and trigger a rollout:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} set env deployment/openclaw \
+  OPENSHELL_GATEWAY_URL="{openshell_gateway_url}"
+kubectl -n {openclaw_namespace} rollout restart deployment/openclaw
+kubectl -n {openclaw_namespace} rollout status deployment/openclaw --timeout=300s
+----
+
+. Retrieve the Route URL, patch it into the Deployment as `OPENCLAW_PUBLIC_URL`, and wait for the pod to become ready:
++
+[source,bash,role="execute"]
+----
+OPENCLAW_URL="$(kubectl -n openclaw get route openclaw -o jsonpath='https://{.spec.host}')"
+kubectl -n openclaw set env deployment/openclaw OPENCLAW_PUBLIC_URL="${OPENCLAW_URL}"
+kubectl -n openclaw rollout status deployment/openclaw --timeout=300s
+printf 'OpenClaw URL: %s\n' "${OPENCLAW_URL}"
+----
++
+Record the URL — you need it to reach the control UI.
+
+=== Verify
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get deployment openclaw
+----
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get pods -l app.kubernetes.io/name=openclaw
+----
+
+One pod should show `1/1` ready and `Running` before you continue.
+
+== Exercise 3: Validate the integration
+
+With OpenClaw running, confirm that the plugin is loaded, the model is reachable, and the OpenShell gateway reports connected.
+
+=== Steps
+
+. Store the running pod name in a shell variable:
++
+[source,bash,role="execute"]
+----
+OPENCLAW_POD="$(kubectl -n openclaw get pod \
+  -l app.kubernetes.io/name=openclaw \
+  --field-selector=status.phase=Running \
+  -o jsonpath='{.items[0].metadata.name}')"
+echo "Pod: ${OPENCLAW_POD}"
+----
+
+. Run the full validation suite inside the pod:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- sh -lc '
+  set -eu
+  node /app/openclaw.mjs --version
+  node /app/openclaw.mjs config validate
+  openshell --version
+  openshell status --gateway-endpoint "${OPENSHELL_GATEWAY_URL}"
+  node /app/openclaw.mjs models status --probe \
+    --probe-provider openai --probe-max-tokens 4 \
+    --probe-timeout 30000 --json
+'
+----
++
+The model probe sends a minimal token request to the OpenAI API.
+Look for `"status": "ok"` in the JSON output alongside a latency measurement.
+`openshell status` should report `connected` for the gateway endpoint.
+
+. Assert that the OpenShell plugin is enabled and at the correct version:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec -i "${OPENCLAW_POD}" -- sh -s <<'REMOTE'
+set -eu
+node /app/openclaw.mjs plugins list --json > /tmp/plugins.json
+node <<'NODE'
+const fs = require('fs');
+const p = JSON.parse(fs.readFileSync('/tmp/plugins.json', 'utf8'))
+  .plugins.find(p => p.id === 'openshell');
+if (!p || !p.enabled || p.status === 'error' ||
+    p.version !== '2026.6.11') process.exit(1);
+console.log(p.id + ' ' + p.version + ' enabled');
+NODE
+REMOTE
+----
++
+Expected output: `openshell 2026.6.11 enabled`
+
+=== Verify
+
+All four checks must pass before you continue to Exercise 4:
+
+* `config validate` exits without errors
+* `models status --probe` shows `"status": "ok"` for the `openai` provider
+* `openshell status` shows `connected` for the in-cluster gateway
+* Plugin assertion prints `openshell 2026.6.11 enabled`
+
+== Exercise 4: Prove delegated tool execution
+
+This exercise produces the central proof of the module.
+You instruct the OpenClaw agent to write a random nonce to a file inside a sandbox.
+Then you read that file from outside the OpenClaw pod to confirm the write happened in the descendant Sandbox pod, not in the OpenClaw container itself.
+
+Three independent pieces of evidence confirm the integration end-to-end:
+
+. The agent command exits with code 0.
+. A Sandbox resource and supervised pod appear in the `{openshell_namespace}` namespace with the session suffix in their names.
+. Reading `/sandbox/level2-proof.txt` from the supervised pod returns the exact nonce.
+
+=== Steps
+
+. Generate a unique session key and a random proof nonce:
++
+[source,bash,role="execute"]
+----
+SESSION_SUFFIX="l2-$(date +%s)-$(openssl rand -hex 3)"
+SESSION_KEY="agent:main:${SESSION_SUFFIX}"
+PROOF_NONCE="$(openssl rand -hex 16)"
+printf 'Session key:  %s\nProof nonce:  %s\n' "${SESSION_KEY}" "${PROOF_NONCE}"
+----
++
+The session key becomes part of the Sandbox resource name.
+The nonce is a value you will read back from the supervised pod to confirm the write happened there.
+
+. Run the agent command. The agent must call the shell execution tool to write the nonce to the file:
++
+[source,bash,role="execute"]
+----
+set -o pipefail
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- sh -lc "
+  set -eu
+  node /app/openclaw.mjs agent --local \
+    --session-key '${SESSION_KEY}' \
+    --message 'Use the shell execution tool to write exactly ${PROOF_NONCE} to /sandbox/level2-proof.txt, then read that file and report success.' \
+    --json
+" | tee "/tmp/${SESSION_SUFFIX}.json"
+----
++
+The outer double-quoted shell expands `${SESSION_KEY}` and `${PROOF_NONCE}` on the client side.
+The expanded values are what reach the pod. The command exits with code 0 on success.
+
+. Find the Sandbox resource that OpenShell created for this session:
++
+[source,bash,role="execute"]
+----
+SANDBOX="$(kubectl -n openshell get \
+  sandboxes.agents.x-k8s.io \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | \
+  grep "^openclaw-agent-main-${SESSION_SUFFIX}" | tail -n 1)"
+echo "Sandbox: ${SANDBOX}"
+test -n "${SANDBOX}"
+----
+
+. Find the supervised pod owned by that Sandbox:
++
+[source,bash,role="execute"]
+----
+SANDBOX_POD="$(kubectl -n openshell get pods \
+  -o 'custom-columns=NAME:.metadata.name,OWNER:.metadata.ownerReferences[0].name' | \
+  awk -v sandbox="${SANDBOX}" '$2 == sandbox {print $1; exit}')"
+echo "Sandbox pod: ${SANDBOX_POD}"
+test -n "${SANDBOX_POD}"
+----
+
+. Read the nonce from inside the supervised pod and confirm it matches:
++
+[source,bash,role="execute"]
+----
+ACTUAL_NONCE="$(kubectl -n openshell exec \
+  "pod/${SANDBOX_POD}" -- cat /sandbox/level2-proof.txt)"
+echo "Expected: ${PROOF_NONCE}"
+echo "Actual:   ${ACTUAL_NONCE}"
+test "${ACTUAL_NONCE}" = "${PROOF_NONCE}"
+----
++
+An exact match confirms the agent's shell tool ran inside the supervised Sandbox pod.
+
+=== Verify
+
+Level 2 is complete when all of the following hold:
+
+* The agent command exited with code 0
+* `${SANDBOX}` is non-empty — a Sandbox resource with the session suffix exists in `{openshell_namespace}`
+* `${SANDBOX_POD}` is non-empty — the Agent Sandbox controller created a supervised pod for this session
+* `${ACTUAL_NONCE}` equals `${PROOF_NONCE}` — the file was written inside the sandbox, not locally
+
+== Dashboard access
+
+The OpenClaw control UI is available at the Route URL you recorded in Exercise 2.
+
+. Retrieve the URL if you did not record it:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw get route openclaw -o jsonpath='https://{.spec.host}'
+echo
+----
+
+. Retrieve the gateway bearer token to authenticate in the UI:
++
+WARNING: The next command prints a live bearer token. Run it only in a private terminal session.
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw get secret openclaw-gateway-token \
+  -o jsonpath='{.data.token}' | base64 -d
+echo
+----
+
+. Open the URL in a browser and enter the bearer token when the UI prompts for it.
+
+== Learning outcomes checkpoint
+
+Before moving to Level 3, confirm you can answer each question:
+
+* How does OpenClaw send tool execution requests to the OpenShell gateway instead of running commands locally in the OpenClaw container?
+* What part of the session key appears in the Sandbox resource name, and why does that matter for debugging?
+* Why are the LLM API key and gateway token stored in Kubernetes Secrets rather than set directly in the Deployment manifest?
+* How would you find the supervised pod for a specific OpenClaw agent session if you only had the session key?
+
+== Cleanup
+
+Remove Sandbox resources created during Exercise 4.
+Keep the OpenClaw Deployment — Level 3 builds on it.
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} delete sandboxes.agents.x-k8s.io \
+  --selector=app.kubernetes.io/name=openclaw \
+  --wait=false
+----
+
+NOTE: Sandbox pods are ephemeral. The pod terminates when the session ends, but the Sandbox custom resource may remain for audit reference. This command removes any residual resources from the exercises above.
+
+To remove OpenClaw entirely and start this level fresh:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl delete namespace {openclaw_namespace}
+----
+
+== Troubleshooting
+
+See xref:07-troubleshooting.adoc[Troubleshooting] for a full reference.
+
+Common issues in this level:
+
+*Pod stuck in `Init:CrashLoopBackOff`* — The init container failed to download the OpenShell CLI binary.
+This usually means a network policy or proxy is blocking the GitHub release URL.
+Check the init container logs:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} logs -l app.kubernetes.io/name=openclaw -c seed-openclaw
+----
+
+*`models status --probe` returns `401 Unauthorized`* — The `my-llm-key` Secret contains an invalid or expired API key.
+Delete and recreate the Secret with a valid key, then restart the Deployment:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} delete secret my-llm-key
+----
+
+*`openshell status` shows `disconnected`* — The OpenShell gateway Service is not reachable from the `{openclaw_namespace}` namespace.
+Confirm the gateway is running and the Service exists:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get pods
+kubectl -n {openshell_namespace} get svc openshell
+----
+
+*No Sandbox resource appears after the agent command* — The plugin may not be enabled, or the session key format is incorrect.
+Re-run Exercise 3 step 3 to confirm plugin status, then repeat Exercise 4.
+
+*Nonce check fails — `ACTUAL_NONCE` does not match `PROOF_NONCE`* — The managed policy may be blocking writes to `/sandbox`.
+Verify the policy ConfigMap includes `/sandbox` in the `read_write` list:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get configmap openclaw-policies -o yaml
+----

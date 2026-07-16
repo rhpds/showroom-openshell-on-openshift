@@ -1,0 +1,154 @@
+= Overview
+:toc:
+:toc-placement: preamble
+:icons: font
+
+Before you change a cluster, take about 15 minutes to understand the components, trust boundaries, risks, and conventions this lab uses.
+
+== Goal
+
+By the end of this overview you will be able to trace a request from the OpenClaw application through the OpenShell gateway to a Sandbox custom resource and a supervised pod, explain why the gateway, controller, and supervisor are separate components, and identify the key trust boundaries in the system.
+
+== Key Concepts
+
+The lab installs and connects five distinct pieces. Each has a specific role; confusing them makes troubleshooting much harder.
+
+OpenClaw application::
+The user-facing agent application. OpenClaw calls the OpenShell CLI or API to delegate work into a sandbox. It does not create Kubernetes resources directly.
+
+OpenShell gateway::
+The control plane. The gateway manages sandbox lifecycle, policy, credentials, logs, and connections. On Kubernetes it creates Sandbox custom resources rather than creating pods directly. Think of it as the policy enforcement point between the agent application and the cluster.
+
+Agent Sandbox controller::
+The Kubernetes SIGs controller that watches Sandbox resources in the `agents.x-k8s.io` API group and reconciles them into pods. It runs as a standard Kubernetes controller deployment and follows the operator pattern.
+
+Sandbox custom resource::
+The Kubernetes declaration of one isolated workload. The gateway writes it; the controller reads it and creates the corresponding pod.
+
+Supervised pod::
+The data-plane pod. The `openshell-sandbox` supervisor prepares isolation and policy enforcement, then starts the agent process with reduced privileges. The gateway maintains a direct connection to the supervised pod for streaming I/O.
+
+== Architecture
+
+The diagram below shows how a request flows from the user through to the running agent process.
+
+[mermaid]
+....
+flowchart LR
+    U[User] --> OC[OpenClaw application]
+    OC --> GW[OpenShell gateway]
+    GW --> CR[Sandbox custom resource]
+    CR --> ASC[Agent Sandbox controller]
+    ASC --> POD[Supervised sandbox pod]
+    GW <--> POD
+    POD --> AG[Agent process]
+....
+
+The gateway sits at the center of the trust model. It is the only component that speaks to both the application layer above and the pod layer below. The controller never talks to the application; the supervised pod never talks to OpenClaw directly.
+
+== Why Three Control-Plane Components?
+
+Platform engineers often ask why the gateway, controller, and supervisor are not merged into one process.
+
+* **The gateway** handles authentication, policy, multi-tenancy, and routing. Keeping it separate means you can upgrade or replace it without touching the Kubernetes controller.
+* **The controller** follows the standard Kubernetes reconciliation pattern. Separating it from the gateway means the Sandbox API can be used by other gateways or tools in the future.
+* **The supervisor** runs inside the pod, in the same kernel namespace as the agent process. It applies Linux-level isolation (filesystem, network, process policy) that cannot be applied from outside the pod.
+
+Each component can be audited, scaled, and updated independently.
+
+== Lab Conventions
+
+All values that vary between environments are managed as Antora attributes defined in `content/antora.yml`. You will see them throughout the lab instructions in curly-brace syntax.
+
+[cols="1,2",options="header"]
+|===
+|Attribute |Purpose
+
+|`{ocp_version}`
+|Target OpenShift version
+
+|`{openshell_namespace}`
+|Namespace where the OpenShell gateway and related resources are installed
+
+|`{openclaw_namespace}`
+|Namespace where OpenClaw is deployed
+
+|`{openshell_version}`
+|OpenShell Helm chart version
+
+|`{agent_sandbox_release}`
+|Agent Sandbox controller release tag
+
+|`{agent_sandbox_manifest}`
+|Full URL to the Agent Sandbox install manifest
+
+|`{openclaw_version}`
+|OpenClaw image version
+
+|`{openshell_plugin_version}`
+|OpenShell plugin version
+|===
+
+When an attribute appears inside a command block, the block will include `subs="attributes"` so the rendered page shows the real value.
+
+[source,bash,role="execute",subs="attributes"]
+----
+oc get pods -n {openshell_namespace}
+----
+
+== Expected Resource Cost
+
+Running through the full lab leaves a small, predictable footprint on the cluster.
+
+After Level 1 you will have:
+
+* One Agent Sandbox controller `Deployment` in `{openshell_namespace}`
+* One OpenShell gateway `StatefulSet` in `{openshell_namespace}`
+
+Each active sandbox adds:
+
+* One `Sandbox` custom resource
+* One supervised pod
+* Normally one workspace `PersistentVolumeClaim`
+
+The cleanup section in each module shows you how to remove these resources if you need to stay within cluster resource limits.
+
+== Tested Versions
+
+[cols="1,1",options="header"]
+|===
+|Component |Version
+
+|OpenShift
+|{ocp_version}
+
+|OpenShell Helm chart
+|{openshell_version}
+
+|Agent Sandbox controller
+|{agent_sandbox_release}
+
+|OpenClaw
+|{openclaw_version}
+
+|OpenShell plugin
+|{openshell_plugin_version}
+|===
+
+== Security Notice
+
+WARNING: This lab is an experimental proof of concept. It is not production security guidance. The evaluation path requires the `privileged` SCC and disables gateway TLS. The lab also permits unauthenticated gateway users. Run this lab only on a private, disposable evaluation cluster. Do not use these configurations on shared or production systems.
+
+== Official References
+
+* https://docs.nvidia.com/openshell/latest/about/how-it-works[OpenShell architecture — how it works]
+* https://agent-sandbox.sigs.k8s.io/[Agent Sandbox documentation (Kubernetes SIGs)]
+* https://docs.nvidia.com/openshell/latest/security/best-practices[OpenShell security controls and best practices]
+
+== Learning Outcomes
+
+By the end of this overview level you should be able to:
+
+* Trace a request from OpenClaw through the gateway to a Sandbox resource and a supervised pod
+* Explain why the gateway, controller, and supervisor are distinct components with distinct trust boundaries
+* Identify the risk model and understand why a disposable evaluation cluster is required for this lab

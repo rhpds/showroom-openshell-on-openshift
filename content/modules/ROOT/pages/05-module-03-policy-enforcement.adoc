@@ -1,0 +1,426 @@
+= Level 3: Policy Enforcement
+:navtitle: Policy Enforcement
+:toc:
+:toc-placement: preamble
+:icons: font
+
+This module proves that a Level 2 descendant sandbox enforces filesystem, process, network, and credential boundaries.
+You will distinguish static controls applied at sandbox creation from dynamic controls evaluated at runtime, then correlate client-side evidence with OpenShell denial logs to confirm each enforcement point is working.
+
+Estimated time: *25 minutes.*
+
+== Goal
+
+By the end of this level you will be able to:
+
+* Explain how creation-time filesystem and Landlock controls differ from runtime network policy enforcement
+* Read and interpret OpenShell denial logs to confirm a network policy blocked a specific request
+* Verify that the sandbox exposes only an opaque credential reference rather than a real provider secret
+* Use a short-lived sandbox to confirm that a policy file parses and applies correctly
+
+== Starting state
+
+Complete xref:04-module-02-openclaw-integration.adoc[Level 2: OpenClaw Integration] before starting this level.
+The descendant sandbox created in Level 2 must still be running, and your shell must have the `OPENCLAW_POD` variable set.
+
+. Confirm the OpenClaw pod is running:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get pods -l app=openclaw
+----
+
+. Check whether `OPENCLAW_POD` is already set from the Level 2 session:
++
+[source,bash,role="execute"]
+----
+echo "OPENCLAW_POD: ${OPENCLAW_POD}"
+----
+
+. If the variable is empty, set it now:
++
+[source,bash,role="execute"]
+----
+OPENCLAW_POD="$(kubectl -n openclaw get pods -l app=openclaw \
+  -o jsonpath='{.items[0].metadata.name}')"
+echo "OPENCLAW_POD: ${OPENCLAW_POD}"
+----
+
+NOTE: If the Level 2 descendant sandbox was cleaned up, re-run the sandbox creation step from Level 2 Exercise 4 before continuing here.
+
+== Network policy rules
+
+The OpenClaw managed policy defines four network rules.
+Any host not listed in a rule is unreachable from within the sandbox.
+
+[cols="2,3,2",options="header"]
+|===
+|Rule |Network access |HTTP-level control
+
+|`github_api_read_only`
+|GitHub API from named binaries
+|Read-only REST methods
+
+|`github_content_reachability`
+|GitHub content endpoints from named binaries
+|None
+
+|`npm_registry_reachability`
+|npm registry from named binaries
+|None
+
+|`openai_api`
+|OpenAI API from agent binaries
+|Full REST access
+|===
+
+Exercises 3 tests the boundary between a listed host and an unlisted host directly.
+
+== Exercise 1: Locate the descendant sandbox
+
+The descendant sandbox name is generated at creation time and includes a random suffix.
+Before you can exec into it, you need its name and the pod the Agent Sandbox controller created for it.
+
+. Resolve the most recent descendant sandbox name:
++
+[source,bash,role="execute"]
+----
+SANDBOX="$(kubectl -n openshell get \
+  sandboxes.agents.x-k8s.io \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | \
+  grep '^openclaw-agent-main-' | tail -n 1)"
+test -n "${SANDBOX}"
+echo "SANDBOX: ${SANDBOX}"
+----
+
+. Find the pod that corresponds to this sandbox:
++
+[source,bash,role="execute"]
+----
+SANDBOX_POD="$(kubectl -n openshell get pods \
+  -o 'custom-columns=NAME:.metadata.name,OWNER:.metadata.ownerReferences[0].name' | \
+  awk -v sandbox="${SANDBOX}" '$2 == sandbox {print $1; exit}')"
+test -n "${SANDBOX_POD}"
+echo "SANDBOX_POD: ${SANDBOX_POD}"
+----
+
+. Confirm the pod is running:
++
+[source,bash,role="execute"]
+----
+kubectl -n openshell get pod "${SANDBOX_POD}"
+----
++
+Expected: pod status is `Running`.
+
+[IMPORTANT]
+====
+The `test -n` calls exit non-zero and abort the block if either variable is empty.
+If that happens, check that the Level 2 sandbox is still active: `kubectl -n openshell get sandboxes.agents.x-k8s.io`.
+====
+
+=== Verify
+
+[source,bash,role="execute"]
+----
+echo "Sandbox: ${SANDBOX}"
+echo "Pod:     ${SANDBOX_POD}"
+----
+
+Both lines must print a non-empty value before you continue.
+
+== Exercise 2: Prove static filesystem controls
+
+Filesystem controls are applied when the sandbox is created.
+They cannot change while the sandbox is running.
+
+This exercise runs a sequence of positive and negative checks through the OpenShell sandbox exec interface.
+
+[IMPORTANT]
+====
+Use `openshell sandbox exec`, not `kubectl exec`, for these checks.
+The OpenShell gateway proxies the connection and enforces controls that `kubectl exec` bypasses entirely.
+====
+
+. Run the filesystem probe inside the sandbox:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- \
+  openshell sandbox exec --name "${SANDBOX}" \
+  --gateway-endpoint \
+  "http://openshell.openshell.svc.cluster.local:8080" \
+  -- sh -lc '
+  set -eu
+  printf allowed >/sandbox/level3-sandbox
+  printf allowed >/tmp/level3-tmp
+  test -r /app
+  if printf denied >/app/level3-denied 2>/tmp/app-error; then exit 1; fi
+  if printf denied >/etc/level3-denied 2>/tmp/etc-error; then exit 1; fi
+  test "$(id -un)" = sandbox
+  test "$(id -gn)" = sandbox
+  printf "allowed: /sandbox /tmp; readable: /app; denied: /app /etc\n"
+'
+----
++
+Expected output: `allowed: /sandbox /tmp; readable: /app; denied: /app /etc`
+
+=== How Landlock modes compare
+
+The `openshell-sandbox` supervisor applies Linux Landlock to the agent process.
+Policy rules declare each restriction as either `best_effort` or `hard_requirement`.
+
+`best_effort`::
+The control is applied when the running kernel supports it.
+If the kernel predates Landlock support, the process starts anyway.
+Use this when you want defence in depth on modern kernels without blocking older environments.
+
+`hard_requirement`::
+The sandbox refuses to start if the kernel cannot enforce the control.
+Use this when the control is essential to your security posture and you prefer a startup failure over a silently unprotected process.
+
+The lab policy uses `hard_requirement` for write restrictions on `/app` and `/etc` so a kernel regression never silently grants write access.
+
+=== Verify
+
+. Confirm the probe printed the expected success line.
+. Confirm no files named `level3-denied` were written in `/app` or `/etc`:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- \
+  openshell sandbox exec --name "${SANDBOX}" \
+  --gateway-endpoint \
+  "http://openshell.openshell.svc.cluster.local:8080" \
+  -- sh -lc '
+  set -eu
+  test ! -f /app/level3-denied
+  test ! -f /etc/level3-denied
+  printf "Confirmed: no denied files written\n"
+'
+----
+
+== Exercise 3: Prove dynamic network controls
+
+Network policy is evaluated at runtime for every outbound connection the sandbox initiates.
+Unlike filesystem controls, network rules can be updated between sandbox runs, but a running sandbox uses the policy active at creation time.
+
+A key challenge with network denial tests is proving that a specific deny log entry corresponds to your specific request rather than a coincidental denial from another process or run.
+This exercise uses a unique hostname to make that correlation unambiguous.
+
+. Generate a unique hostname for this test run:
++
+[source,bash,role="execute"]
+----
+DENIED_HOST="level3-$(date +%s)-$(openssl rand -hex 3).example.com"
+printf 'Unique denied host: %s\n' "${DENIED_HOST}"
+----
+
+. Test a listed endpoint (should be allowed) and the unique unlisted hostname (should be denied):
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- \
+  openshell sandbox exec --name "${SANDBOX}" \
+  --gateway-endpoint \
+  "http://openshell.openshell.svc.cluster.local:8080" \
+  --env "DENIED_HOST=${DENIED_HOST}" \
+  -- sh -lc '
+  set -eu
+  allowed_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+    https://api.github.com/rate_limit)"
+  test "${allowed_code}" != 000
+  denied_code="$(curl -sS -o /dev/null -w "%{http_code}" \
+    "https://${DENIED_HOST}" 2>/tmp/unlisted-error || true)"
+  test "${denied_code}" = 000
+  printf "Allowed request HTTP code: %s\n" "${allowed_code}"
+  printf "Denied request HTTP code: %s\n" "${denied_code}"
+'
+----
++
+The GitHub request returns a real HTTP status code — typically `200` or `429`.
+The unique hostname returns `000`, which curl reports when the connection closes before any HTTP response arrives.
+That is the gateway's signal for a network deny.
+
+. Wait for the denial log to flush, then fetch the sandbox logs:
++
+[source,bash,role="execute"]
+----
+sleep 2
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- \
+  openshell logs "${SANDBOX}" --since 2m --source sandbox \
+  --gateway-endpoint \
+  "http://openshell.openshell.svc.cluster.local:8080" | \
+  tee /tmp/level3-openshell.log
+----
+
+. Confirm the log names your unique host and records a denial:
++
+[source,bash,role="execute"]
+----
+grep -F "${DENIED_HOST}" /tmp/level3-openshell.log | \
+  grep -Ei 'deny|denied|blocked'
+----
++
+Expected: at least one line containing both your unique hostname and a denial keyword.
+
+=== Why the unique hostname matters
+
+A generic test hostname such as `denied.example.com` can match log entries from another sandbox, a previous run, or a background process — making the grep ambiguous.
+Using a timestamp and random bytes guarantees the matching log entry is yours.
+
+The proof chain is then complete: client-side `http_code=000` shows the connection was closed before any HTTP response, and the matching server-side log entry shows the gateway evaluated that specific request against the policy and recorded the denial with the exact host you requested.
+
+=== Verify
+
+Both of the following must be true before you continue:
+
+* The curl test inside the sandbox printed `Denied request HTTP code: 000`
+* The log grep returned at least one matching line
+
+== Exercise 4: Observe a credential reference safely
+
+OpenClaw passes the OpenAI API key to the sandbox as an opaque reference string, not as the real key value.
+The gateway resolves the reference to the real credential only when the sandbox initiates an eligible outbound request to a listed endpoint.
+
+This design means the agent process cannot exfiltrate the raw API key.
+Even if the agent is compromised, it holds only a reference token that is useless outside the gateway's trust context.
+
+. Check what the sandbox environment actually contains for `OPENAI_API_KEY`:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- \
+  openshell sandbox exec --name "${SANDBOX}" \
+  --gateway-endpoint \
+  "http://openshell.openshell.svc.cluster.local:8080" \
+  -- sh -lc '
+  case "${OPENAI_API_KEY:-}" in
+    openshell:resolve:env:*) printf "%s\n" \
+      "openshell:resolve:env:OPENAI_API_KEY" ;;
+    *) printf "unexpected credential reference shape\n" >&2; exit 1 ;;
+  esac
+'
+----
++
+Expected output: `openshell:resolve:env:OPENAI_API_KEY`
+
+The prefix `openshell:resolve:env:` is the reference format the gateway recognises.
+When the sandbox process sends an outbound HTTP request to a listed endpoint that requires credentials, the gateway rewrites the `Authorization` header by substituting the real value at the network layer — inside the gateway process, never inside the sandbox.
+
+WARNING: If the sandbox environment contains the real API key rather than the `openshell:resolve:env:` reference, stop and review the Level 2 OpenClaw deployment configuration before continuing. A real key in the sandbox defeats the gateway trust boundary.
+
+=== Verify
+
+* The command above must print exactly `openshell:resolve:env:OPENAI_API_KEY`
+* A non-zero exit or the message `unexpected credential reference shape` indicates a policy misconfiguration in the Level 2 deployment
+
+== Exercise 5: Validate a fresh policy load
+
+This exercise creates a short-lived sandbox to confirm the managed policy file parses and applies without errors.
+The sandbox exits immediately after the test and is independent of the Level 2 descendant sandbox.
+
+. Create the disposable sandbox and run filesystem checks in a single command:
++
+[source,bash,role="execute"]
+----
+kubectl -n openclaw exec "${OPENCLAW_POD}" -- \
+  openshell sandbox create --name level3-policy-check --no-keep \
+  --no-auto-providers \
+  --policy /opt/openclaw/config/policies/openclaw-managed-policy.yaml \
+  --gateway-endpoint \
+  "http://openshell.openshell.svc.cluster.local:8080" \
+  -- sh -lc '
+  set -eu
+  test -w /sandbox
+  test ! -w /etc
+  printf "Policy checks passed: /sandbox is writable; /etc is not writable\n"
+'
+----
++
+Expected output: `Policy checks passed: /sandbox is writable; /etc is not writable`
++
+The `--no-keep` flag tells the gateway to destroy the sandbox when the command exits.
+The `--no-auto-providers` flag skips credential injection, which is not needed for a filesystem-only policy check.
+
+. Confirm the sandbox was cleaned up:
++
+[source,bash,role="execute"]
+----
+kubectl -n openshell get sandboxes.agents.x-k8s.io | grep level3-policy-check || echo "Confirmed: sandbox cleaned up"
+----
+
+=== Verify
+
+* The sandbox creation command must print the expected success line
+* The cleanup check must confirm the `level3-policy-check` sandbox no longer exists
+
+== Level 3 complete: verification checklist
+
+All five items below must pass before you proceed to Level 4.
+
+[cols="1,3",options="header"]
+|===
+|Check |Expected result
+
+|Filesystem writes
+|Writes to `/sandbox` and `/tmp` succeed; `/app` is readable; writes to `/app` and `/etc` fail
+
+|Listed network request
+|GitHub API request returns a non-`000` HTTP code (typically `200` or `429`)
+
+|Unlisted network request
+|Unique unlisted hostname returns `http_code=000` from inside the sandbox
+
+|Denial log correlation
+|OpenShell log contains the exact `DENIED_HOST` value alongside a denial keyword
+
+|Credential reference
+|Sandbox environment contains `openshell:resolve:env:OPENAI_API_KEY`, not a real key
+
+|Policy validation
+|Short-lived `level3-policy-check` sandbox starts, applies policy, and is cleaned up on exit
+|===
+
+== Learning outcomes
+
+By the end of this level you should be able to:
+
+* Explain how creation-time filesystem and Landlock controls differ from runtime network policy evaluation
+* Describe how binary-scoped network rules and L7 REST method enforcement work together
+* Explain how OpenShell credential references protect provider secrets from agent-side exfiltration
+* Correlate client-side `http_code=000` with an OpenShell denial log entry using a unique hostname as a correlation key
+
+== Troubleshooting
+
+[cols="2,3",options="header"]
+|===
+|Symptom |Resolution
+
+|`test -n "${SANDBOX}"` exits non-zero
+|The Level 2 descendant sandbox is not running. Re-run the sandbox creation step from Level 2 Exercise 4.
+
+|`openshell sandbox exec` hangs or times out
+|Check that the gateway pod is running: `kubectl -n openshell get pods`. Restart the gateway pod if it is not in `Running` state.
+
+|GitHub API request returns `000` (should be allowed)
+|The sandbox may be using an outdated policy that does not include `github_api_read_only`. Inspect the managed policy file and re-create the sandbox.
+
+|Unlisted host returns a real HTTP code (should return `000`)
+|Network policy is not being enforced. Confirm the OpenShell gateway version supports network policy and that the policy loaded without errors at sandbox creation time.
+
+|Log grep returns no matches
+|Wait an additional 5 seconds and re-run the log fetch command. If still empty, confirm the `--since 2m` window covers your test and that the correct sandbox name is used.
+
+|Credential check fails with `unexpected credential reference shape`
+|The real API key is in the sandbox environment. Review the Level 2 OpenClaw deployment and confirm the key is supplied as a Secret reference, not a literal value.
+
+|Policy validation sandbox fails to start
+|The policy YAML has a parse error. Inspect the file: `kubectl -n openclaw exec "${OPENCLAW_POD}" -- cat /opt/openclaw/config/policies/openclaw-managed-policy.yaml`.
+|===
+
+For issues not covered here, see xref:07-troubleshooting.adoc[Troubleshooting].
+
+== Next steps
+
+Continue to xref:06-module-04-policy-profiles.adoc[Level 4: Policy Profiles] to compare the deny-all, managed, and allowlist sandbox postures side by side.

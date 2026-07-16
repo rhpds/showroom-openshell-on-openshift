@@ -1,0 +1,747 @@
+= Level 4: Policy Profiles
+:navtitle: Level 4: Policy Profiles
+:toc:
+:toc-placement: preamble
+:icons: font
+
+This level runs the same GitHub inspection prompt through three OpenClaw instances — each with a different policy posture — and compares the results side by side.
+Budget about 35 minutes, not counting initial image pulls.
+
+== Learning Objectives
+
+* Compare deny-all, managed, and endpoint-allowlist policies against an identical prompt and explain the observed differences
+* Distinguish between endpoint-only reachability and REST read-only enforcement at the policy level
+* Use a shared RUN_ID to tie comparison results to the correct session and sandbox
+* Read effective policy from a running Sandbox resource and match it to observed tool output
+
+== Starting State
+
+This level assumes Level 3 is complete with all verification checks passing.
+The following resources must exist before you begin:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openshell_namespace} get statefulset openshell-gateway
+kubectl -n {openclaw_namespace} get secret my-llm-key
+----
+
+Both commands must return resources.
+If either fails, return to the level where it was created before continuing here.
+
+== Exercise 1: Predict the Comparison
+
+Before running any commands, study this table and form a prediction for each profile.
+
+Every variable in this comparison stays constant across all three runs: the same OpenClaw application image, the same model, the same gateway, and the same prompt text.
+Only the policy changes.
+
+[cols="1,2,2",options="header"]
+|===
+|Profile |Expected tool result |Effective-policy distinction
+
+|`deny`
+|No HTTP response; policy denial recorded in gateway logs
+|No GitHub endpoint rule — outbound HTTP is blocked entirely
+
+|`managed`
+|HTTP 200 with repository name `NVIDIA/OpenShell`
+|REST read-only GitHub API rule scoped to named binaries and the `GET` method
+
+|`demo-allowlist`
+|HTTP 200 with repository name `NVIDIA/OpenShell`
+|Endpoint-only allowlist for `api.github.com`; no binary or HTTP method restriction
+|===
+
+Notice that `managed` and `demo-allowlist` both permit the network call, but for fundamentally different reasons.
+`managed` enforces that the calling binary is in a named set and that the HTTP method is read-only.
+`demo-allowlist` only checks whether the destination host is on the allowlist.
+
+Come back to this table after Exercise 6 and compare your predictions against the actual results.
+
+=== Verify
+
+No commands to run.
+Review the table above and write down your predictions before continuing.
+
+== Exercise 2: Create Profile Gateway Tokens
+
+Each OpenClaw instance authenticates to the OpenShell gateway with its own bearer token.
+Generate and store a random 32-byte token for each profile:
+
+. Create the three Secrets:
++
+[source,bash,role="execute"]
+----
+for profile in deny managed demo-allowlist; do
+  openssl rand -hex 32 | kubectl -n openclaw \
+    create secret generic "openclaw-${profile}-gateway-token" \
+    --from-file=token=/dev/stdin --dry-run=client -o yaml | \
+    kubectl apply -f -
+done
+----
+
+. Confirm all three Secrets were created:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get secrets \
+  openclaw-deny-gateway-token \
+  openclaw-managed-gateway-token \
+  openclaw-demo-allowlist-gateway-token
+----
+
+All three must appear in the output before continuing.
+
+=== Verify
+
+All 3 Secrets appear in the `kubectl get secrets` output without errors.
+
+== Exercise 3: Deploy the Profiles
+
+This exercise creates the Kustomize manifests for all three OpenClaw profile instances and applies them to the cluster.
+The three instances share the same application image and gateway endpoint.
+Only their policy ConfigMaps and gateway token references differ.
+
+=== Step 1: Create the directory structure
+
+[source,bash,role="execute"]
+----
+mkdir -p /tmp/policy-profiles/overlays/{deny,managed,demo-allowlist}
+----
+
+=== Step 2: Create the deny profile
+
+The deny profile has no GitHub endpoint rule in its policy.
+The OpenShell gateway blocks all outbound HTTP attempts from a sandbox running under this policy.
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/deny/policy.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-deny-policy
+  namespace: openclaw
+data:
+  policy.yaml: |
+    version: "1"
+    name: deny-all
+    description: No outbound HTTP endpoints permitted
+    network:
+      rules: []
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/deny/config.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-deny-config
+  namespace: openclaw
+data:
+  openclaw.json: |
+    {
+      "instanceId": "openclaw-deny",
+      "model": "gpt-4o",
+      "apiEndpoint": "https://api.openai.com/v1",
+      "policyConfigMap": "openclaw-deny-policy",
+      "sandboxNamespace": "openshell",
+      "gatewayEndpoint": "http://openshell.openshell.svc.cluster.local:8080"
+    }
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/deny/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-deny
+  namespace: openclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw-deny
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openclaw-deny
+    spec:
+      containers:
+        - name: openclaw
+          image: quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-llm-key
+                  key: api-key
+          volumeMounts:
+            - name: gateway-token
+              mountPath: /var/run/secrets/gateway-token
+              readOnly: true
+            - name: config
+              mountPath: /etc/openclaw
+              readOnly: true
+      volumes:
+        - name: gateway-token
+          secret:
+            secretName: openclaw-deny-gateway-token
+        - name: config
+          configMap:
+            name: openclaw-deny-config
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/deny/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - policy.yaml
+  - config.yaml
+  - deployment.yaml
+EOF
+----
+
+=== Step 3: Create the managed profile
+
+The managed profile allows GitHub API calls only from named binaries using `GET` or `HEAD` methods.
+This enforces read-only access at both the HTTP method and calling-binary level.
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/managed/policy.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-managed-policy
+  namespace: openclaw
+data:
+  policy.yaml: |
+    version: "1"
+    name: github-api-read-only
+    description: REST read-only access to GitHub API, restricted to named binaries
+    network:
+      rules:
+        - name: github_api_read_only
+          endpoints:
+            - host: api.github.com
+              port: 443
+          methods:
+            - GET
+            - HEAD
+          binaries:
+            - curl
+            - wget
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/managed/config.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-managed-config
+  namespace: openclaw
+data:
+  openclaw.json: |
+    {
+      "instanceId": "openclaw-managed",
+      "model": "gpt-4o",
+      "apiEndpoint": "https://api.openai.com/v1",
+      "policyConfigMap": "openclaw-managed-policy",
+      "sandboxNamespace": "openshell",
+      "gatewayEndpoint": "http://openshell.openshell.svc.cluster.local:8080"
+    }
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/managed/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-managed
+  namespace: openclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw-managed
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openclaw-managed
+    spec:
+      containers:
+        - name: openclaw
+          image: quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-llm-key
+                  key: api-key
+          volumeMounts:
+            - name: gateway-token
+              mountPath: /var/run/secrets/gateway-token
+              readOnly: true
+            - name: config
+              mountPath: /etc/openclaw
+              readOnly: true
+      volumes:
+        - name: gateway-token
+          secret:
+            secretName: openclaw-managed-gateway-token
+        - name: config
+          configMap:
+            name: openclaw-managed-config
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/managed/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - policy.yaml
+  - config.yaml
+  - deployment.yaml
+EOF
+----
+
+=== Step 4: Create the demo-allowlist profile
+
+The demo-allowlist profile permits `api.github.com` to be reached from any binary using any HTTP method.
+It checks reachability only — there is no binary or method restriction.
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/demo-allowlist/policy.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-demo-allowlist-policy
+  namespace: openclaw
+data:
+  policy.yaml: |
+    version: "1"
+    name: demo-endpoint-allowlist
+    description: Endpoint-only allowlist — reachability enforced, no binary or method restriction
+    network:
+      rules:
+        - name: github_endpoint_allowlist
+          endpoints:
+            - host: api.github.com
+              port: 443
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/demo-allowlist/config.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openclaw-demo-allowlist-config
+  namespace: openclaw
+data:
+  openclaw.json: |
+    {
+      "instanceId": "openclaw-demo-allowlist",
+      "model": "gpt-4o",
+      "apiEndpoint": "https://api.openai.com/v1",
+      "policyConfigMap": "openclaw-demo-allowlist-policy",
+      "sandboxNamespace": "openshell",
+      "gatewayEndpoint": "http://openshell.openshell.svc.cluster.local:8080"
+    }
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/demo-allowlist/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openclaw-demo-allowlist
+  namespace: openclaw
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openclaw-demo-allowlist
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openclaw-demo-allowlist
+    spec:
+      containers:
+        - name: openclaw
+          image: quay.io/ryan_nix/openclaw-openshift@sha256:a91dbc1cc1879a46137da1b73e5c270ea3094cdc3753f5ce8636168c9e1d8d0c
+          env:
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: my-llm-key
+                  key: api-key
+          volumeMounts:
+            - name: gateway-token
+              mountPath: /var/run/secrets/gateway-token
+              readOnly: true
+            - name: config
+              mountPath: /etc/openclaw
+              readOnly: true
+      volumes:
+        - name: gateway-token
+          secret:
+            secretName: openclaw-demo-allowlist-gateway-token
+        - name: config
+          configMap:
+            name: openclaw-demo-allowlist-config
+EOF
+----
+
+[source,bash,role="execute"]
+----
+cat > /tmp/policy-profiles/overlays/demo-allowlist/kustomization.yaml << 'EOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - policy.yaml
+  - config.yaml
+  - deployment.yaml
+EOF
+----
+
+=== Step 5: Apply all three profiles
+
+[source,bash,role="execute"]
+----
+for profile in deny managed demo-allowlist; do
+  kubectl kustomize "/tmp/policy-profiles/overlays/${profile}" | \
+    kubectl -n openclaw apply -f -
+  kubectl -n openclaw rollout status \
+    "deployment/openclaw-${profile}" --timeout=300s
+done
+----
+
+Wait for each profile to report `successfully rolled out` before the loop advances to the next one.
+
+=== Verify
+
+Confirm all three pods are running:
+
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get pods \
+  -l 'app.kubernetes.io/name in (openclaw-deny,openclaw-managed,openclaw-demo-allowlist)'
+----
+
+All three pods must show `Running` status before continuing to Exercise 4.
+
+== Exercise 4: Run the Controlled Prompt
+
+This exercise sends the same prompt to each profile instance in sequence.
+The prompt instructs the agent to run exactly one shell command and stop — no additional tool calls, no substitution from the model's own knowledge.
+
+WARNING: Do not modify the prompt text between profiles. Any change invalidates the comparison.
+
+. Set the fixed prompt and generate a run ID:
++
+[source,bash,role="execute"]
+----
+FIXED_PROMPT="$(cat <<'EOF'
+Use the shell execution tool exactly once to run this exact command, then stop:
+curl -sS -o /sandbox/level4-github.json -w '%{http_code}' \
+  https://api.github.com/repos/NVIDIA/OpenShell \
+  > /sandbox/level4-http-code || true
+Do not substitute your own knowledge for tool output.
+EOF
+)"
+
+RUN_ID="$(date +%s)-$(openssl rand -hex 3)"
+printf 'Comparison run: %s\n' "${RUN_ID}"
+----
++
+Record the `RUN_ID` value printed to the terminal.
+Every subsequent command in this exercise uses it.
+
+. Run the prompt through each profile:
++
+[source,bash,role="execute"]
+----
+for profile in deny managed demo-allowlist; do
+  case "${profile}" in
+    deny) session_code=d ;;
+    managed) session_code=m ;;
+    demo-allowlist) session_code=a ;;
+  esac
+  session_key="agent:main:l4-${session_code}-${RUN_ID}"
+  pod="$(kubectl -n openclaw get pod \
+    -l "app.kubernetes.io/name=openclaw-${profile}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}')"
+  test -n "${pod}"
+  printf '\n--- Running profile: %s (pod: %s) ---\n' "${profile}" "${pod}"
+  kubectl -n openclaw exec "${pod}" -- \
+    node /app/openclaw.mjs agent --local \
+      --session-key "${session_key}" \
+      --message "${FIXED_PROMPT}" --json | \
+    tee "/tmp/level4-${profile}-${RUN_ID}.json"
+done
+----
++
+Each run takes 20 to 60 seconds depending on model latency.
+The loop prints the session key and pod name before each run so you can track progress.
+
+=== Verify
+
+Confirm output files were created for all three profiles:
+
+[source,bash,role="execute"]
+----
+ls -lh "/tmp/level4-deny-${RUN_ID}.json" \
+        "/tmp/level4-managed-${RUN_ID}.json" \
+        "/tmp/level4-demo-allowlist-${RUN_ID}.json"
+----
+
+Each file must exist and have a non-zero size.
+An empty or missing file means the agent run failed before producing output.
+Check the pod logs with `kubectl -n openclaw logs <pod-name>` if a run does not complete.
+
+== Exercise 5: Correlate Descendant Sandboxes
+
+Each agent run created one Sandbox custom resource in the `openshell` namespace.
+This exercise maps each profile name to its Sandbox name using the RUN_ID timestamp, so the artifact reads in Exercise 6 target the correct sandbox.
+
+. Collect the Sandbox name for each profile and write a mapping file:
++
+[source,bash,role="execute"]
+----
+(
+RUN_STAMP="${RUN_ID%%-*}"
+: >"/tmp/level4-sandboxes-${RUN_ID}"
+for profile in deny managed demo-allowlist; do
+  case "${profile}" in
+    deny) session_code=d ;;
+    managed) session_code=m ;;
+    demo-allowlist) session_code=a ;;
+  esac
+  matches="$(kubectl -n openshell get \
+    sandboxes.agents.x-k8s.io \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | \
+    grep "^openclaw-agent-main-l4-${session_code}-${RUN_STAMP}-" || true)"
+  count="$(printf '%s\n' "${matches}" | awk 'NF {n++} END {print n+0}')"
+  if test "${count}" != 1; then
+    printf 'Expected one Sandbox for %s; found %s\n' \
+      "${profile}" "${count}" >&2
+    exit 1
+  fi
+  printf '%s %s\n' "${profile}" "${matches}" | \
+    tee -a "/tmp/level4-sandboxes-${RUN_ID}"
+done
+)
+----
+
+. Review the profile-to-sandbox mapping:
++
+[source,bash,role="execute"]
+----
+cat "/tmp/level4-sandboxes-${RUN_ID}"
+----
+
+=== Verify
+
+[source,bash,role="execute"]
+----
+wc -l < "/tmp/level4-sandboxes-${RUN_ID}"
+----
+
+The output must be `3`.
+
+If you see a count other than `3`, check that the `RUN_ID` variable is still set in your shell and that all three agent runs in Exercise 4 completed without error.
+A count mismatch can also mean a Sandbox from an earlier run shares the same timestamp prefix — re-run Exercise 4 with a fresh `RUN_ID` in that case.
+
+== Exercise 6: Judge Tool Output
+
+Read the HTTP status code and repository name that each agent wrote into its sandbox filesystem.
+These values come directly from the `curl` command output — not from the model's text response.
+
+. Read the artifacts from each sandbox:
++
+[source,bash,role="execute"]
+----
+for profile in deny managed demo-allowlist; do
+  sandbox="$(awk -v profile="${profile}" \
+    '$1 == profile {print $2}' "/tmp/level4-sandboxes-${RUN_ID}")"
+  test -n "${sandbox}"
+  pod="$(kubectl -n openclaw get pod \
+    -l "app.kubernetes.io/name=openclaw-${profile}" \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{.items[0].metadata.name}')"
+  printf '\n=== %s (sandbox: %s) ===\n' "${profile}" "${sandbox}"
+  kubectl -n openclaw exec "${pod}" -- \
+    openshell sandbox exec --name "${sandbox}" \
+    --gateway-endpoint \
+    "http://openshell.openshell.svc.cluster.local:8080" \
+    -- sh -lc 'printf "status="; cat /sandbox/level4-http-code; \
+      printf " repository="; \
+      if test -f /sandbox/level4-github.json; then \
+        sed -n '\''s/.*"full_name"[[:space:]]*:[[:space:]]*"\([^" ]*\)".*/\1/p'\'' \
+        /sandbox/level4-github.json | head -n 1; fi; printf "\n"'
+done
+----
+
+=== Verify
+
+Compare your output against the prediction table from Exercise 1:
+
+[cols="1,2,2",options="header"]
+|===
+|Profile |Expected status |Expected repository
+
+|`deny`
+|`status=000`
+|No value — `curl` never ran, file not written
+
+|`managed`
+|`status=200`
+|`NVIDIA/OpenShell`
+
+|`demo-allowlist`
+|`status=200`
+|`NVIDIA/OpenShell`
+|===
+
+If `deny` returns a non-zero HTTP status, the policy is not blocking as expected.
+Check the `openclaw-deny-policy` ConfigMap and confirm the network rules list is empty.
+
+If `managed` or `demo-allowlist` returns `000`, outbound network access is blocked at the cluster infrastructure level, independently of OpenShell policy.
+Check for an egress NetworkPolicy in the `openclaw` namespace.
+
+== Exercise 7: Inspect Effective Policy and Denial Evidence
+
+The final exercise reads the effective policy from each Sandbox resource and checks the gateway logs for the denial record that the deny profile generated.
+
+. Read the effective policy from each sandbox:
++
+[source,bash,role="execute"]
+----
+for profile in deny managed demo-allowlist; do
+  sandbox="$(awk -v profile="${profile}" \
+    '$1 == profile {print $2}' "/tmp/level4-sandboxes-${RUN_ID}")"
+  test -n "${sandbox}"
+  printf '\n=== Effective policy: %s ===\n' "${profile}"
+  kubectl -n openshell get sandbox "${sandbox}" \
+    -o jsonpath='{.status.effectivePolicy}' | \
+    python3 -m json.tool 2>/dev/null || \
+  kubectl -n openshell get sandbox "${sandbox}" \
+    -o jsonpath='{.status.effectivePolicy}'
+  printf '\n'
+done
+----
+
+. Check the OpenShell gateway logs for denial evidence from the deny profile run:
++
+[source,bash,role="execute"]
+----
+kubectl -n openshell logs statefulset/openshell-gateway \
+  --since=15m | grep -i "deny\|api\.github\.com" | tail -20
+----
+
+Expected: at least one log line naming `api.github.com` with a denial reason such as `network_policy_deny` or `no_matching_rule`, produced during the deny-profile agent run.
+
+=== Verify
+
+Review the effective policy content against these expectations:
+
+[cols="1,3",options="header"]
+|===
+|Profile |Expected effective policy content
+
+|`deny`
+|Network rules section is empty (`rules: []`) — no GitHub endpoint present
+
+|`managed`
+|Contains a rule named `github_api_read_only` with `GET` and `HEAD` methods and named binary restrictions (`curl`, `wget`)
+
+|`demo-allowlist`
+|Contains a rule naming `api.github.com` with no method or binary restrictions
+|===
+
+== Verification
+
+Level 4 passes when all of the following are true:
+
+* The `deny` profile returns `status=000` and the gateway logs contain a denial entry naming `api.github.com`
+* The `managed` profile returns `status=200` with repository name `NVIDIA/OpenShell`
+* The `demo-allowlist` profile returns `status=200` with repository name `NVIDIA/OpenShell`
+* The `managed` effective policy contains a rule named `github_api_read_only` specifying `GET`/`HEAD` methods and named binaries
+* The `demo-allowlist` effective policy contains a rule naming `api.github.com` with no method or binary restrictions
+* The `deny` effective policy contains no GitHub endpoint in its network rules
+* All three result files at `/tmp/level4-*-${RUN_ID}.json` reflect the current `RUN_ID`
+
+== Learning Outcomes Checkpoint
+
+Answer these questions before moving on:
+
+. What does `status=000` mean in the context of this comparison, and why does it differ from `status=200`?
+. Both `managed` and `demo-allowlist` permit the GitHub API call. What restriction does `managed` enforce that `demo-allowlist` does not?
+. A colleague proposes a new policy that adds `api.github.com` to an endpoint allowlist but specifies no HTTP methods or binaries. Which existing profile does it most resemble? What single addition would make it equivalent to the `managed` profile?
+. Why is it critical that all three profiles share the same model, prompt, application image, and gateway during this comparison?
+
+== Cleanup
+
+Remove the profile resources and sandbox artifacts from this level.
+The OpenShell gateway and the `my-llm-key` Secret are preserved — they are needed in the Troubleshooting module.
+
+. Delete the Sandbox resources created during the comparison run:
++
+[source,bash,role="execute"]
+----
+while IFS=' ' read -r profile sandbox; do
+  kubectl -n openshell delete sandbox "${sandbox}" --ignore-not-found
+done < "/tmp/level4-sandboxes-${RUN_ID}"
+----
+
+. Remove the profile Deployments, ConfigMaps, and gateway-token Secrets:
++
+[source,bash,role="execute"]
+----
+for profile in deny managed demo-allowlist; do
+  kubectl -n openclaw delete deployment "openclaw-${profile}" --ignore-not-found
+  kubectl -n openclaw delete configmap \
+    "openclaw-${profile}-config" \
+    "openclaw-${profile}-policy" --ignore-not-found
+  kubectl -n openclaw delete secret \
+    "openclaw-${profile}-gateway-token" --ignore-not-found
+done
+----
+
+. Remove the temporary manifest files and result artifacts:
++
+[source,bash,role="execute"]
+----
+rm -rf /tmp/policy-profiles /tmp/level4-*
+----
+
+. Confirm no profile Deployments remain:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl -n {openclaw_namespace} get deployments
+----
+
+The cleanup is complete when none of `openclaw-deny`, `openclaw-managed`, or `openclaw-demo-allowlist` appear in the output.
+
+Continue to xref:07-troubleshooting.adoc[Troubleshooting].

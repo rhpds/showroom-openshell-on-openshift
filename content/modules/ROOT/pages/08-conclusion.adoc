@@ -1,0 +1,105 @@
+= Conclusion
+:navtitle: Conclusion
+:toc:
+:toc-placement: preamble
+:icons: font
+
+Congratulations on completing the {lab_name} lab.
+You built a full supervised AI agent execution stack on OpenShift, from controller installation through policy profile comparison.
+
+== What you accomplished
+
+[cols="1,3",options="header"]
+|===
+|Level |Achievement
+
+|1 -- OpenShell on OpenShift
+|Installed the Agent Sandbox controller ({agent_sandbox_release}), deployed the OpenShell gateway ({openshell_version}) via Helm, connected the CLI, and created a smoke-test sandbox that proved the full lifecycle
+
+|2 -- OpenClaw integration
+|Deployed OpenClaw with the OpenShell sandbox backend, configured Secret-backed LLM and gateway credentials, and proved delegated tool execution by writing and reading a nonce inside a descendant sandbox pod
+
+|3 -- Policy enforcement
+|Explored filesystem controls (Landlock read-only and read-write paths), dynamic network policies (endpoint allowlists, REST read-only enforcement, binary-scoped rules), process identity, and credential references in a live sandbox session
+
+|4 -- Policy profiles
+|Ran an identical prompt through deny-all, managed, and endpoint-allowlist policy profiles, correlated each run to its Sandbox resource, compared tool output, and inspected the effective policy applied by the gateway
+|===
+
+== Architecture recap
+
+The stack you deployed follows this flow:
+
+....
+OpenClaw (agent application)
+     |  sends tool execution request
+     v
+OpenShell gateway (StatefulSet in {openshell_namespace})
+     |  creates Sandbox CR with attached policy
+     v
+Agent Sandbox controller (Deployment in agent-sandbox-system)
+     |  reconciles CR into supervised pod
+     v
+Sandbox pod (supervisor sidecar enforces policy)
+....
+
+Every tool execution runs inside a supervised pod.
+The policy profile attached to the Sandbox CR determines what the process can reach on the filesystem, network, and at the process identity level.
+
+== Full cleanup
+
+Remove all lab resources when you are finished.
+Run these commands in order from your bastion terminal.
+
+. Delete the OpenClaw namespace and all its resources:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl delete namespace {openclaw_namespace} --ignore-not-found
+----
+
+. Delete the OpenShell namespace:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl delete namespace {openshell_namespace} --ignore-not-found
+----
+
+. Remove the Agent Sandbox controller:
++
+[source,bash,role="execute",subs="attributes"]
+----
+kubectl delete -f {agent_sandbox_manifest} --ignore-not-found
+----
+
+. Stop the port-forward if it is still running:
++
+[source,bash,role="execute"]
+----
+pkill -f 'port-forward svc/openshell' || true
+----
+
+. Confirm no lab resources remain:
++
+[source,bash,role="execute"]
+----
+kubectl get crd sandboxes.agents.x-k8s.io 2>/dev/null && \
+  echo "CRD still present" || echo "CRD removed"
+----
+
+== Next steps
+
+* **Production hardening**: Enable TLS on the OpenShell gateway, remove `dangerouslyDisableDeviceAuth`, and replace the `privileged` SCC with a scoped custom SCC.
+* **Custom policies**: Write your own policy profile tailored to your agent's toolset. Start from the `managed` profile and add or remove endpoint rules.
+* **Multiple gateways**: Deploy separate OpenShell gateways per team or environment, each with its own JWT signing keys and policy defaults.
+* **Observability**: Integrate gateway logs and Sandbox resource events with your cluster monitoring stack to track sandbox lifecycles and policy denials.
+
+== Resources
+
+* https://github.com/NVIDIA/OpenShell[OpenShell on GitHub^]
+* https://github.com/kubernetes-sigs/agent-sandbox[Agent Sandbox controller^]
+* https://github.com/NVIDIA/OpenClaw[OpenClaw on GitHub^]
+* xref:07-troubleshooting.adoc[Lab troubleshooting reference]
+
+Thank you for working through this lab.
+If you ran into issues not covered by the troubleshooting page, please file them against the lab repository.

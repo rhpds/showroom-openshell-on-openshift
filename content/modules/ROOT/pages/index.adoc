@@ -1,94 +1,114 @@
-= What is Showroom?
-:navtitle: What is Showroom?
+= OpenShell and OpenClaw on Red Hat OpenShift
+:navtitle: Home
 
-Showroom is a web-based lab instruction platform for the https://demo.redhat.com[Red Hat Demo Platform].
-It combines rendered AsciiDoc content with embedded terminals, consoles, and interactive tools -- giving workshop and demo participants everything they need in a single browser tab.
+Your team needs to evaluate supervised AI agent execution on OpenShift — running agent workloads in isolated sandboxes with configurable security policies.
+This lab walks you through every layer of that stack: installing the infrastructure, connecting an agent application, and testing what security policies actually enforce.
 
-== What Users See
+You work on a real OpenShift {ocp_version} cluster with cluster-admin access.
+Each module ends in a verified, stable state, so you can stop after any module and return later.
 
-When a participant opens their Showroom URL they get a split-pane interface:
+== Lab path
 
-* **Left pane** -- step-by-step lab instructions rendered from an https://antora.org[Antora] site you author in AsciiDoc.
-* **Right pane** -- one or more tabs such as:
-** A web terminal (SSH to a bastion, containerised CLI tools, or both).
-** The OpenShift web console embedded in an iframe.
-** A VS Code editor (Code Server).
-** A VNC desktop (noVNC).
-** Any external URL you choose.
-
-The UI layout, tab names, and tab URLs are all controlled by a simple `ui-config.yml` file that lives in your content repository.
-
-== How It Gets Deployed
-
-This Ansible collection -- `agnosticd.showroom` -- is the primary way Showroom instances are deployed on the Red Hat Demo Platform.
-Depending on the environment type, you use one of two roles:
-
-[cols="1,3",options="header"]
+[cols="^1,3,^2,5",options="header"]
 |===
-|Role |Use when...
+|Step |Module |Time |What you do
 
-|`ocp4_workload_showroom`
-|Your lab runs on an OpenShift 4 cluster.
-The role deploys Showroom as a pod using a Helm chart, complete with content rendering, terminals, and an OpenShift `Route`.
+|Overview
+|xref:01-overview.adoc[Overview and concepts]
+|15 min
+|Map the components, understand trust boundaries, review the architecture, and set lab shell variables
 
-|`vm_workload_showroom`
-|Your lab runs on a VM (RHEL, Fedora, etc.).
-The role deploys Showroom with rootless Podman, Traefik for TLS, and systemd for lifecycle management.
-|===
+|1
+|xref:03-module-01-openshell-install.adoc[OpenShell on OpenShift]
+|30 min
+|Install the Agent Sandbox controller and OpenShell gateway; prove that a supervised sandbox pod can be created and destroyed
 
-Both roles follow the same basic flow:
+|2
+|xref:04-module-02-openclaw-integration.adoc[OpenClaw Integration]
+|30 min
+|Deploy OpenClaw, wire its delegated tool execution into OpenShell sandboxes, and confirm that agent calls run inside supervised pods
 
-. Clone your Antora content repository.
-. Inject runtime variables (credentials, hostnames, GUIDs) as AsciiDoc attributes.
-. Render the content to HTML.
-. Serve the content alongside the terminal and tab services you configured.
-. Publish the final URL back to the user.
+|3
+|xref:05-module-03-policy-enforcement.adoc[Policy Enforcement]
+|25 min
+|Test filesystem, network, process, and credential boundary enforcement inside a running sandbox
 
-== Key Concepts
-
-Content repository::
-A Git repo containing your AsciiDoc lab instructions, structured as an Antora component.
-You typically fork https://github.com/rhpds/showroom_template_nookbag[showroom_template_nookbag] and add your own pages.
-See xref:content-repo.adoc[].
-
-AgnosticV catalog item::
-The YAML configuration in the https://github.com/rhpds/agnosticv[agnosticv] repository that ties your content repo to an environment on the Red Hat Demo Platform.
-See xref:agnosticv-config.adoc[].
-
-User data::
-A set of key-value pairs (hostnames, passwords, URLs) written by infrastructure roles during provisioning and automatically injected into your content as Antora attributes.
-See xref:user-data.adoc[].
-
-UI configuration::
-A `ui-config.yml` file in your content repo that defines the tabs, layout width, and dynamic URLs shown alongside your lab instructions.
-See xref:ui-config.adoc[].
-
-== Where to Start
-
-[cols="1,3",options="header"]
-|===
-|Goal |Page
-
-|Get a Showroom lab running quickly
-|xref:quick-start.adoc[]
-
-|Create or structure a content repo
-|xref:content-repo.adoc[]
-
-|Wire up an AgnosticV catalog item
-|xref:agnosticv-config.adoc[]
-
-|Understand the full architecture
-|xref:architecture.adoc[]
-
-|Contribute to Showroom itself
-|xref:contributing.adoc[]
+|4
+|xref:06-module-04-policy-profiles.adoc[Policy Profiles]
+|35 min
+|Compare deny-all, managed, and allowlist profiles against the same workload and observe the behavioral differences
 |===
 
-== Related Projects
+*Total estimated time: 2 hours 15 minutes*
 
-* https://github.com/agnosticd/showroom[agnosticd.showroom collection] -- this Ansible collection (you are here).
-* https://github.com/rhpds/showroom_template_nookbag[showroom_template_nookbag] -- the recommended content repo template.
-* https://github.com/rhpds/showroom-deployer[showroom-deployer] -- Helm charts that power OCP deployments.
-* https://github.com/rhpds/showroom-images[showroom-images] -- container images (content server, terminals, Antora, etc.).
-* https://github.com/rhpds/nookbag[nookbag] -- the zero-touch UI bundle.
+A shared xref:07-troubleshooting.adoc[troubleshooting guide] covers diagnosis and corrective actions for all modules.
+
+== What you'll learn
+
+* Install Agent Sandbox controller and OpenShell gateway on OpenShift {ocp_version}
+* Deploy OpenClaw and configure delegated execution into supervised sandboxes
+* Apply filesystem, network, and process security policies to sandbox pods
+* Compare deny-all, managed, and allowlist policy profiles under controlled conditions
+
+== Who this is for
+
+This lab is for platform engineers and cluster administrators who are evaluating whether supervised AI agent workloads fit their OpenShift environment.
+You should be comfortable working with `oc`, Helm, and Kubernetes custom resources.
+
+*Experience level*: Intermediate
+
+== Prerequisites
+
+Before starting, confirm you have all of the following:
+
+* Access to an existing OpenShift {ocp_version} cluster
+* Cluster-admin privileges
+* `oc`, `kubectl`, and Helm installed locally with a kubeconfig targeting the cluster
+* Permission to use an LLM API credential for the OpenClaw modules (Module 2 onward)
+
+Cluster provisioning and obtaining cluster-admin access are outside the scope of this lab.
+
+== Tested environment
+
+All modules were validated together on the environment below.
+
+[cols="2,3",options="header"]
+|===
+|Component |Validated version
+
+|Red Hat OpenShift
+|{ocp_version}
+
+|OpenShell Helm chart
+|{openshell_version}
+
+|Agent Sandbox controller
+|{agent_sandbox_release}
+
+|OpenClaw image
+|{openclaw_version}
+
+|OpenShell plugin
+|{openshell_plugin_version}
+|===
+
+If your cluster differs significantly from these versions, note any discrepancies before you begin — version mismatches are the first thing to check when behavior differs from the lab guide.
+
+== Security notice
+
+[WARNING]
+====
+This lab is an experimental proof of concept, not production security guidance.
+Some modules use the `privileged` SCC for sandbox pods, disable gateway TLS, and permit unauthenticated gateway access.
+These settings exist to keep the exercises repeatable on a test cluster.
+Run this lab only on a private, disposable evaluation cluster.
+Do not expose the OpenShell gateway Service or its port-forward to untrusted clients.
+====
+
+The supervised agent process still receives OpenShell's process, filesystem, network, and inference controls.
+Those controls do not make a privileged, plaintext, unauthenticated configuration safe for production.
+Read each warning before applying a configuration, and do not treat any lab setting as a recommended production posture.
+
+== Get started
+
+Click *Overview and concepts* in the navigation to begin, or go directly to xref:01-overview.adoc[].

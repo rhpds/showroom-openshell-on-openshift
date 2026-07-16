@@ -1,19 +1,11 @@
-* xref:index.adoc[What is Showroom?]
+* xref:index.adoc[Home]
 
-.Content Developer Guide
-* xref:quick-start.adoc[Quick Start]
-* xref:content-repo.adoc[Creating a Content Repository]
-* xref:agnosticv-config.adoc[AgnosticV Configuration]
-* xref:ui-config.adoc[UI Configuration]
-* xref:user-data.adoc[User Data and Variables]
-* xref:attribute-example.adoc[Attribute Injection Example]
-* xref:ocp4-role-reference.adoc[OCP4 Role Reference]
-* xref:vm-role-reference.adoc[VM Role Reference]
-
-.Showroom Developer Guide
-* xref:architecture.adoc[Architecture]
-* xref:deployer.adoc[Showroom Deployer]
-* xref:images.adoc[Showroom Images]
-* xref:nookbag.adoc[Nookbag UI]
-* xref:ocp-integration.adoc[OCP Integration]
-* xref:contributing.adoc[Contributing]
+.Lab Modules
+* xref:01-overview.adoc[Overview]
+* xref:02-details.adoc[Prerequisites and Environment]
+* xref:03-module-01-openshell-install.adoc[Level 1: OpenShell on OpenShift]
+* xref:04-module-02-openclaw-integration.adoc[Level 2: OpenClaw Integration]
+* xref:05-module-03-policy-enforcement.adoc[Level 3: Policy Enforcement]
+* xref:06-module-04-policy-profiles.adoc[Level 4: Policy Profiles]
+* xref:07-troubleshooting.adoc[Troubleshooting]
+* xref:08-conclusion.adoc[Conclusion]
