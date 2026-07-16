@@ -28,18 +28,7 @@ It manages sandbox creation, JWT signing for workload identity, and graceful tea
 
 The relationship between the components:
 
-....
-openshell CLI
-     │  (HTTP / port-forward)
-     ▼
-OpenShell gateway (StatefulSet: openshell-0)
-     │  (creates Sandbox CRs)
-     ▼
-Agent Sandbox controller (Deployment: agent-sandbox-controller)
-     │  (creates supervised pods)
-     ▼
-Sandbox pod (with supervisor sidecar)
-....
+image::openshell-component-stack.svg[Component relationship from CLI through gateway to sandbox pod,link=self,width=100%]
 
 == Exercise 1: Install the Agent Sandbox Controller
 

@@ -30,18 +30,7 @@ You built a full supervised AI agent execution stack on OpenShift, from controll
 
 The stack you deployed follows this flow:
 
-....
-OpenClaw (agent application)
-     |  sends tool execution request
-     v
-OpenShell gateway (StatefulSet in {openshell_namespace})
-     |  creates Sandbox CR with attached policy
-     v
-Agent Sandbox controller (Deployment in agent-sandbox-system)
-     |  reconciles CR into supervised pod
-     v
-Sandbox pod (supervisor sidecar enforces policy)
-....
+image::openshell-recap-stack.svg[Full stack from OpenClaw through gateway and controller to supervised sandbox pod,link=self,width=100%]
 
 Every tool execution runs inside a supervised pod.
 The policy profile attached to the Sandbox CR determines what the process can reach on the filesystem, network, and at the process identity level.

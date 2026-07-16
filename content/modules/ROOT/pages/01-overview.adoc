@@ -32,17 +32,7 @@ The data-plane pod. The `openshell-sandbox` supervisor prepares isolation and po
 
 The diagram below shows how a request flows from the user through to the running agent process.
 
-[mermaid]
-....
-flowchart LR
-    U[User] --> OC[OpenClaw application]
-    OC --> GW[OpenShell gateway]
-    GW --> CR[Sandbox custom resource]
-    CR --> ASC[Agent Sandbox controller]
-    ASC --> POD[Supervised sandbox pod]
-    GW <--> POD
-    POD --> AG[Agent process]
-....
+image::openshell-architecture.svg[Request flow from user through OpenClaw to supervised sandbox pod,link=self,width=100%]
 
 The gateway sits at the center of the trust model. It is the only component that speaks to both the application layer above and the pod layer below. The controller never talks to the application; the supervised pod never talks to OpenClaw directly.
 
