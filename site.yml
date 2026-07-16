@@ -1,7 +1,7 @@
 ---
 site:
-  title: Showroom Template Demo
-  url: https://github.com/rhpds/showroom_template_nookbag
+  title: OpenShell and OpenClaw on Red Hat OpenShift
+  url: https://github.com/rhpds/showroom-openshell-on-openshift
   start_page: modules::index.adoc
 
 content:
